@@ -3541,12 +3541,22 @@ func (a *App) SwitchWorkspace(dir string) (string, error) {
 		return "", fmt.Errorf("%s is not a directory", dir)
 	}
 	saveWorkspace(dir)
+	// Register the project in the projects file immediately so it appears in
+	// the sidebar even if subsequent steps fail.
+	_ = addProject(dir, "")
 
 	// Open a registered topic so the new workspace appears in the project tree
 	// immediately instead of only existing as an in-memory tab.
 	topic, err := a.CreateTopic("project", dir, "")
 	if err != nil {
-		return "", err
+		// CreateTopic can fail when the workspace directory is read-only
+		// (setTopicTitleWithSource / setTopicCreatedAt write into
+		// <dir>/.reasonix/). The project has already been registered via
+		// addProject above, so emit a tree-changed event and return the
+		// workspace root instead of propagating the error.
+		slog.Warn("desktop: SwitchWorkspace CreateTopic failed", "dir", dir, "err", err)
+		a.emitProjectTreeChanged()
+		return dir, nil
 	}
 	var meta TabMeta
 	if a.singleSurfaceLayoutEnabled() {
@@ -3555,7 +3565,16 @@ func (a *App) SwitchWorkspace(dir string) (string, error) {
 		meta, err = a.OpenProjectTab(dir, topic.ID)
 	}
 	if err != nil {
-		return "", err
+		// The project has already been registered via CreateTopic and the
+		// tab has been opened by OpenProjectTab. The error here typically
+		// comes from keepOnlyVisibleTab failing to snapshot an existing
+		// tab's session — which is non-critical for the workspace switch
+		// itself. Emit a tree-changed event so the frontend refreshes the
+		// sidebar, then return the workspace root instead of propagating
+		// the error so the user sees their newly added project.
+		slog.Warn("desktop: SwitchWorkspace post-registration step failed", "dir", dir, "err", err)
+		a.emitProjectTreeChanged()
+		return dir, nil
 	}
 	return meta.WorkspaceRoot, nil
 }

@@ -825,9 +825,13 @@ export function ProjectTree({
     setAddingProject(true);
     try {
       await onAddProject();
-      await refresh();
+    } catch (err) {
+      console.warn("Failed to add project", err);
     } finally {
       setAddingProject(false);
+      // Always refresh so the sidebar reflects any changes even if the
+      // onAddProject callback threw before the caller could refresh.
+      void refresh();
     }
   };
 

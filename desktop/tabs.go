@@ -2955,13 +2955,57 @@ func singleSurfaceTabsFile(f desktopTabsFile) desktopTabsFile {
 	return desktopTabsFile{Tabs: []desktopTabEntry{chosen}, ActiveTab: chosen.ID}
 }
 
+var (
+	desktopConfigDirOnce  sync.Once
+	desktopConfigDirCache string
+)
+
 func desktopConfigDir() string {
+	desktopConfigDirOnce.Do(func() {
+		desktopConfigDirCache = resolveDesktopConfigDir()
+	})
+	return desktopConfigDirCache
+}
+
+// resetDesktopConfigDirCacheForTesting resets the cached config dir so tests
+// that change HOME / XDG_CONFIG_HOME get a fresh resolution.
+func resetDesktopConfigDirCacheForTesting() {
+	desktopConfigDirOnce = sync.Once{}
+	desktopConfigDirCache = ""
+}
+
+func resolveDesktopConfigDir() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		home, _ := os.UserHomeDir()
-		return filepath.Join(home, ".reasonix")
+		return filepath.Join(home, ".reasonix", "desktop")
 	}
-	return filepath.Join(dir, "reasonix")
+	primary := filepath.Join(dir, "reasonix")
+	// If the primary config directory exists but is not writable (e.g., it
+	// was created by root or another user), fall back to
+	// ~/.reasonix/desktop so the app can still persist its state.
+	if info, statErr := os.Stat(primary); statErr == nil && info.IsDir() {
+		if !isDirWritable(primary) {
+			if fallback := config.MemoryUserDir(); fallback != "" {
+				return filepath.Join(fallback, "desktop")
+			}
+			home, _ := os.UserHomeDir()
+			return filepath.Join(home, ".reasonix", "desktop")
+		}
+	}
+	return primary
+}
+
+// isDirWritable reports whether the current process can create files in dir.
+func isDirWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".writable-test-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	f.Close()
+	os.Remove(name)
+	return true
 }
 
 func (a *App) saveTabsLocked() {
@@ -3684,25 +3728,64 @@ const (
 	topicTitleSourceManual = "manual"
 )
 
-func topicTitlesPath(workspaceRoot string) string {
+// projectTopicMetaDir resolves the directory used to store topic metadata
+// (titles, sources, created-ats) for a project. It prefers
+// <workspaceRoot>/.reasonix/ but falls back to
+// <desktopConfigDir()>/projects/<slug>/ when that directory is not writable
+// (e.g. owned by root).
+var projectTopicMetaDirCache sync.Map // workspaceRoot (string) -> dir (string)
+
+func projectTopicMetaDir(workspaceRoot string) string {
 	if workspaceRoot == "" {
-		return filepath.Join(desktopConfigDir(), "global", topicTitlesFile)
+		return filepath.Join(desktopConfigDir(), "global")
 	}
-	return filepath.Join(workspaceRoot, ".reasonix", topicTitlesFile)
+	if v, ok := projectTopicMetaDirCache.Load(workspaceRoot); ok {
+		return v.(string)
+	}
+	primary := filepath.Join(workspaceRoot, ".reasonix")
+	dir := primary
+	if !isDirWritableOrCreatable(primary) {
+		slug := config.WorkspaceSlug(workspaceRoot)
+		dir = filepath.Join(desktopConfigDir(), "projects", slug)
+	}
+	projectTopicMetaDirCache.Store(workspaceRoot, dir)
+	return dir
+}
+
+// resetProjectTopicMetaDirCacheForTesting clears the cache so tests with
+// isolated dirs get a fresh resolution.
+func resetProjectTopicMetaDirCacheForTesting() {
+	projectTopicMetaDirCache = sync.Map{}
+}
+
+// isDirWritableOrCreatable reports whether dir is a writable directory, or
+// can be created (i.e. its parent is writable) if it does not yet exist.
+func isDirWritableOrCreatable(dir string) bool {
+	info, err := os.Stat(dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return false
+		}
+		// Directory doesn't exist — check if the parent is writable so
+		// os.MkdirAll can create it.
+		return isDirWritable(filepath.Dir(dir))
+	}
+	if !info.IsDir() {
+		return false
+	}
+	return isDirWritable(dir)
+}
+
+func topicTitlesPath(workspaceRoot string) string {
+	return filepath.Join(projectTopicMetaDir(workspaceRoot), topicTitlesFile)
 }
 
 func topicTitleSourcesPath(workspaceRoot string) string {
-	if workspaceRoot == "" {
-		return filepath.Join(desktopConfigDir(), "global", topicTitleSourcesFile)
-	}
-	return filepath.Join(workspaceRoot, ".reasonix", topicTitleSourcesFile)
+	return filepath.Join(projectTopicMetaDir(workspaceRoot), topicTitleSourcesFile)
 }
 
 func topicCreatedAtsPath(workspaceRoot string) string {
-	if workspaceRoot == "" {
-		return filepath.Join(desktopConfigDir(), "global", topicCreatedAtsFile)
-	}
-	return filepath.Join(workspaceRoot, ".reasonix", topicCreatedAtsFile)
+	return filepath.Join(projectTopicMetaDir(workspaceRoot), topicCreatedAtsFile)
 }
 
 const topicFileReadTimeout = 200 * time.Millisecond

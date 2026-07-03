@@ -1650,7 +1650,13 @@ export function useController() {
   }, [activeTabId, dispatchTo]);
 
   const refreshWorkspaceState = useCallback(async (path: string): Promise<string> => {
-    if (path) await syncActiveTabFromBackend(true);
+    if (path) {
+      try {
+        await syncActiveTabFromBackend(true);
+      } catch (err) {
+        console.warn("syncActiveTabFromBackend failed after workspace switch", err);
+      }
+    }
     return path;
   }, [syncActiveTabFromBackend]);
 

@@ -105,6 +105,8 @@ func isolateDesktopUserDirs(t *testing.T) string {
 	t.Setenv("REASONIX_STATE_HOME", filepath.Join(home, "state"))
 	t.Setenv("REASONIX_CACHE_HOME", filepath.Join(home, "cache"))
 	t.Setenv("AppData", appData)
+	resetDesktopConfigDirCacheForTesting()
+	resetProjectTopicMetaDirCacheForTesting()
 	return home
 }
 
