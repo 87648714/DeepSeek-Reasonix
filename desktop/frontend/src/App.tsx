@@ -2124,8 +2124,9 @@ export default function App() {
         "--chat-min-width": `${chatReservedWidth}px`,
         "--workspace-width": `${workspacePanelRenderWidth}px`,
         "--workspace-resizer-width": `${WORKSPACE_RESIZER_WIDTH}px`,
+        "--maxw": workspacePanelRenderable ? undefined : "none",
       }) as CSSProperties,
-    [chatReservedWidth, sidebarRenderWidth, workspacePanelRenderWidth],
+    [chatReservedWidth, sidebarRenderWidth, workspacePanelRenderWidth, workspacePanelRenderable],
   );
 
   const setWorkspacePanel = useCallback((open: boolean) => {
