@@ -42,6 +42,7 @@ type ProviderView struct {
 	Default           string                      `json:"default"`
 	APIKeyEnv         string                      `json:"apiKeyEnv"`
 	Headers           map[string]string           `json:"headers"`
+	ExtraBody         map[string]any              `json:"extraBody"`
 	KeySet            bool                        `json:"keySet"` // the env var currently resolves to a non-empty value
 	RequiresKey       bool                        `json:"requiresKey"`
 	Configured        bool                        `json:"configured"` // selectable: either key is present or no key is required
@@ -97,6 +98,7 @@ type AgentView struct {
 	Temperature       float64 `json:"temperature"`
 	MaxSteps          int     `json:"maxSteps"`
 	PlannerMaxSteps   int     `json:"plannerMaxSteps"`
+	MaxSubagentDepth  int     `json:"maxSubagentDepth"`
 	SystemPrompt      string  `json:"systemPrompt"`
 	ColdResumePrune   bool    `json:"coldResumePrune"`
 	ReasoningLanguage string  `json:"reasoningLanguage"`
@@ -220,6 +222,13 @@ func nonNil(s []string) []string {
 func nonNilStringMap(m map[string]string) map[string]string {
 	if m == nil {
 		return map[string]string{}
+	}
+	return m
+}
+
+func nonNilAnyMap(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
 	}
 	return m
 }
@@ -395,6 +404,7 @@ func providerViewFromEntryForRootWithResolver(p config.ProviderEntry, builtIn, a
 		Models: nonNil(models), VisionModels: nonNil(providerVisionModels(models, visionModels)), VisionModelsSet: visionModelsSet, ModelsURL: p.ModelsURL, Default: p.DefaultModel(),
 		APIKeyEnv:         p.APIKeyEnv,
 		Headers:           nonNilStringMap(p.Headers),
+		ExtraBody:         nonNilAnyMap(p.ExtraBody),
 		KeySet:            key.Set,
 		RequiresKey:       requiresKey,
 		Configured:        !requiresKey || key.Set,
@@ -504,7 +514,7 @@ func (a *App) Settings() SettingsView {
 				Deny:  []string{},
 			},
 			Sandbox:                 SandboxView{Bash: "enforce", AllowWrite: []string{}, Shell: "auto"},
-			Agent:                   AgentView{PlannerMaxSteps: 0, ColdResumePrune: true, ReasoningLanguage: "auto"},
+			Agent:                   AgentView{PlannerMaxSteps: 0, MaxSubagentDepth: agent.DefaultMaxSubagentDepth, ColdResumePrune: true, ReasoningLanguage: "auto"},
 			Bot:                     botSettingsView(config.BotConfig{}),
 			AutoPlan:                "off",
 			DesktopLayoutStyle:      "workbench",
@@ -562,7 +572,7 @@ func (a *App) Settings() SettingsView {
 				Password: cfg.Network.Proxy.Password,
 			},
 		},
-		Agent:                   AgentView{Temperature: cfg.Agent.Temperature, MaxSteps: cfg.Agent.MaxSteps, PlannerMaxSteps: cfg.Agent.PlannerMaxSteps, SystemPrompt: cfg.Agent.SystemPrompt, ColdResumePrune: cfg.ColdResumePruneEnabled(), ReasoningLanguage: cfg.ReasoningLanguage()},
+		Agent:                   AgentView{Temperature: cfg.Agent.Temperature, MaxSteps: cfg.Agent.MaxSteps, PlannerMaxSteps: cfg.Agent.PlannerMaxSteps, MaxSubagentDepth: desktopMaxSubagentDepth(cfg.Agent.MaxSubagentDepth), SystemPrompt: cfg.Agent.SystemPrompt, ColdResumePrune: cfg.ColdResumePruneEnabled(), ReasoningLanguage: cfg.ReasoningLanguage()},
 		Bot:                     botSettingsView(cfg.Bot),
 		DesktopLanguage:         cfg.DesktopLanguage(),
 		DesktopLayoutStyle:      cfg.DesktopLayoutStyle(),
@@ -1116,6 +1126,24 @@ func (a *App) SetSubagentEffort(level string) error {
 	})
 }
 
+func desktopMaxSubagentDepth(depth int) int {
+	if depth <= 0 {
+		return agent.DefaultMaxSubagentDepth
+	}
+	if depth == 1 {
+		return 1
+	}
+	return agent.DefaultMaxSubagentDepth
+}
+
+// SetMaxSubagentDepth controls whether first-layer subagents may delegate once more.
+func (a *App) SetMaxSubagentDepth(depth int) error {
+	return a.applyConfigChange(func(c *config.Config) error {
+		c.Agent.MaxSubagentDepth = desktopMaxSubagentDepth(depth)
+		return nil
+	})
+}
+
 // SetAutoPlan updates the automatic plan-mode gate (off|on).
 func (a *App) SetAutoPlan(mode string) error {
 	if err := a.ensureLiveControllersRuntimeMutationAllowed("auto-plan"); err != nil {
@@ -1303,6 +1331,7 @@ func (a *App) SaveProvider(p ProviderView) error {
 		e.ModelsURL = strings.TrimSpace(p.ModelsURL)
 		e.APIKeyEnv = p.APIKeyEnv
 		e.Headers = p.Headers
+		e.ExtraBody = p.ExtraBody
 		e.BalanceURL = strings.TrimSpace(p.BalanceURL)
 		e.ContextWindow = p.ContextWindow
 		e.ReasoningProtocol = p.ReasoningProtocol
