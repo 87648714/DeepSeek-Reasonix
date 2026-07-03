@@ -51,6 +51,9 @@ func TestEnsureBlankTabInheritsActiveTabLocalSettings(t *testing.T) {
 	if created == nil {
 		t.Fatalf("new tab %q missing from app.tabs", meta.ID)
 	}
+	if created.model != "inherit/model" {
+		t.Fatalf("model = %q, want inherited \"inherit/model\"", created.model)
+	}
 	if created.effort == nil || *created.effort != "max" {
 		t.Fatalf("effort = %v, want inherited \"max\"", created.effort)
 	}
@@ -71,7 +74,59 @@ func TestEnsureBlankTabInheritsActiveTabLocalSettings(t *testing.T) {
 	}
 }
 
-func TestEnsureBlankTabUsesGlobalSessionDefaultsForModelAndToolApproval(t *testing.T) {
+func TestEnsureBlankTabInheritsActiveTabModel(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	workspace := robustTempDir(t)
+	if err := os.WriteFile(filepath.Join(workspace, "reasonix.toml"),
+		[]byte(""), 0o644); err != nil {
+		t.Fatalf("write workspace config: %v", err)
+	}
+
+	// Config default is deepseek-pro, but the active tab uses a different model.
+	// The new session should inherit the active tab's model, not the config default.
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if err := cfg.SetDefaultModel("deepseek-pro/deepseek-v4-pro"); err != nil {
+		t.Fatalf("SetDefaultModel: %v", err)
+	}
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save user config: %v", err)
+	}
+
+	app := NewApp()
+	src := &WorkspaceTab{
+		ID:            "src",
+		Scope:         "project",
+		WorkspaceRoot: workspace,
+		TopicID:       "topic_src",
+		SessionPath:   filepath.Join(workspace, "src.jsonl"),
+		model:         "deepseek-flash/deepseek-v4-flash",
+		disabledMCP:   map[string]ServerView{},
+	}
+	src.sink = &tabEventSink{tabID: "src", app: app}
+	app.tabs["src"] = src
+	app.tabOrder = []string{"src"}
+	app.activeTabID = "src"
+
+	meta, err := app.EnsureBlankTab("project", workspace)
+	if err != nil {
+		t.Fatalf("EnsureBlankTab: %v", err)
+	}
+	created := app.tabs[meta.ID]
+	if created == nil {
+		t.Fatalf("new tab %q missing from app.tabs", meta.ID)
+	}
+	if created.model != "deepseek-flash/deepseek-v4-flash" {
+		t.Fatalf("new tab model = %q, want inherited active tab model %q", created.model, "deepseek-flash/deepseek-v4-flash")
+	}
+	if src.model != "deepseek-flash/deepseek-v4-flash" {
+		t.Fatalf("existing tab should not be overwritten, got model=%q", src.model)
+	}
+	if !strings.Contains(filepath.Base(created.SessionPath), "deepseek-v4-flash") {
+		t.Fatalf("new session path = %q, want filename seeded by inherited model", created.SessionPath)
+	}
+}
+
+func TestEnsureBlankTabFallsBackToConfigDefaultWhenActiveTabHasNoModel(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	workspace := robustTempDir(t)
 	if err := os.WriteFile(filepath.Join(workspace, "reasonix.toml"),
@@ -97,7 +152,7 @@ func TestEnsureBlankTabUsesGlobalSessionDefaultsForModelAndToolApproval(t *testi
 		WorkspaceRoot:    workspace,
 		TopicID:          "topic_src",
 		SessionPath:      filepath.Join(workspace, "src.jsonl"),
-		model:            "deepseek-flash/deepseek-v4-flash",
+		model:            "", // no model on active tab
 		mode:             "plan",
 		toolApprovalMode: control.ToolApprovalAsk,
 		disabledMCP:      map[string]ServerView{},
@@ -116,13 +171,13 @@ func TestEnsureBlankTabUsesGlobalSessionDefaultsForModelAndToolApproval(t *testi
 		t.Fatalf("new tab %q missing from app.tabs", meta.ID)
 	}
 	if created.model != "deepseek-pro/deepseek-v4-pro" {
-		t.Fatalf("new tab model = %q, want global default model", created.model)
+		t.Fatalf("new tab model = %q, want global default model (active tab has none)", created.model)
 	}
 	if created.toolApprovalMode != control.ToolApprovalAuto {
 		t.Fatalf("new tab toolApprovalMode = %q, want global default auto", created.toolApprovalMode)
 	}
-	if src.model != "deepseek-flash/deepseek-v4-flash" || src.toolApprovalMode != control.ToolApprovalAsk {
-		t.Fatalf("existing tab should not be overwritten, got model=%q approval=%q", src.model, src.toolApprovalMode)
+	if src.toolApprovalMode != control.ToolApprovalAsk {
+		t.Fatalf("existing tab should not be overwritten, got approval=%q", src.toolApprovalMode)
 	}
 	if !strings.Contains(filepath.Base(created.SessionPath), "deepseek-v4-pro") {
 		t.Fatalf("new session path = %q, want filename seeded by global default model", created.SessionPath)

@@ -1524,10 +1524,12 @@ func (a *App) EnsureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
 		}
 	}
 
-	// New blank sessions start from global session defaults for model and
-	// Ask/Auto/YOLO approval posture. Keep the remaining execution-local settings
-	// from the active tab so a new blank session preserves effort/token/MCP
-	// continuity without letting the active tab override global defaults (#4019).
+	// New blank sessions start from global session defaults for Ask/Auto/YOLO
+	// approval posture, but inherit the active tab's model so switching models
+	// via the Composer switcher carries into subsequent sessions. Keep the
+	// remaining execution-local settings from the active tab so a new blank
+	// session preserves model/effort/token/MCP continuity (#4019 relaxed for
+	// model inheritance).
 	inheritedModel := defaultModel
 	var inheritedEffort *string
 	inheritedTokenMode := boot.TokenModeFull
@@ -1536,6 +1538,9 @@ func (a *App) EnsureBlankTab(scope, workspaceRoot string) (TabMeta, error) {
 	inheritedDisabledMCP := map[string]ServerView{}
 	var inheritedMCPOrder []string
 	if active := a.activeTabLocked(); active != nil {
+		if m := strings.TrimSpace(active.model); m != "" {
+			inheritedModel = m
+		}
 		inheritedEffort = cloneStringPtr(active.effort)
 		inheritedTokenMode = currentTabTokenMode(active)
 		inheritedDisabledMCP = cloneServerViewMap(active.disabledMCP)
