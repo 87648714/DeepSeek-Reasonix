@@ -624,6 +624,141 @@ func TestNewMiniMaxSetsFlag(t *testing.T) {
 	}
 }
 
+// TestBuildRequestZhipuThinking covers the Zhipu GLM wire shape: thinking.type
+// is enabled|disabled and reasoning_effort is never sent (the endpoint ignores
+// it). Auto (empty effort) defaults to "enabled" — the GLM model default.
+func TestBuildRequestZhipuThinking(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		effort       string
+		wantThinking string
+	}{
+		{name: "auto-defaults-to-enabled", effort: "", wantThinking: "enabled"},
+		{name: "enabled", effort: "enabled", wantThinking: "enabled"},
+		{name: "disabled", effort: "disabled", wantThinking: "disabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := (&client{model: "glm-4.5-air", zhipu: true, effort: tc.effort}).buildRequest(provider.Request{})
+			if req.Thinking == nil || req.Thinking.Type != tc.wantThinking {
+				t.Fatalf("Thinking = %+v, want %q", req.Thinking, tc.wantThinking)
+			}
+			if req.ReasoningEffort != "" {
+				t.Fatalf("Zhipu must not send reasoning_effort, got %q", req.ReasoningEffort)
+			}
+		})
+	}
+}
+
+// TestNewZhipuEffortValidation locks in boot-time validation for the Zhipu path.
+// The config effort layer remaps depth levels, so by the time effort reaches the
+// factory it must be one of: "", "enabled", "disabled".
+func TestNewZhipuEffortValidation(t *testing.T) {
+	base := provider.Config{Name: "glm", BaseURL: "https://open.bigmodel.cn/api/paas/v4", Model: "glm-4.5-air", APIKey: "k"}
+	for _, ok := range []string{"", "enabled", "disabled"} {
+		if _, err := New(withEffort(base, ok)); err != nil {
+			t.Errorf("effort=%q should be accepted: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"high", "low", "max", "adaptive"} {
+		if _, err := New(withEffort(base, bad)); err == nil {
+			t.Errorf("effort=%q should be rejected", bad)
+		}
+	}
+}
+
+// TestNewZhipuSetsFlag is a smoke test for base-URL detection across both the
+// China (bigmodel.cn) and international (z.ai) GLM endpoints.
+func TestNewZhipuSetsFlag(t *testing.T) {
+	for _, baseURL := range []string{
+		"https://open.bigmodel.cn/api/paas/v4",
+		"https://api.z.ai/api/paas/v4",
+	} {
+		p, err := New(provider.Config{Name: "glm", BaseURL: baseURL, Model: "glm-4.5-air", APIKey: "k"})
+		if err != nil {
+			t.Fatalf("New(%q): %v", baseURL, err)
+		}
+		if c := p.(*client); !c.zhipu {
+			t.Errorf("zhipu flag not set for baseURL=%q", baseURL)
+		}
+	}
+}
+
+// TestBuildRequestGenericThinking covers the vendor-agnostic `thinking` config
+// field on a provider we don't auto-detect: thinking.type is emitted as set, and
+// an empty/unset field leaves thinking off the wire entirely.
+func TestBuildRequestGenericThinking(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		thinking string
+		wantType string // "" means no thinking field
+	}{
+		{name: "enabled", thinking: "enabled", wantType: "enabled"},
+		{name: "disabled", thinking: "disabled", wantType: "disabled"},
+		{name: "unset-omits", thinking: "", wantType: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := (&client{model: "some-model", thinkingType: tc.thinking}).buildRequest(provider.Request{})
+			if tc.wantType == "" {
+				if req.Thinking != nil {
+					t.Fatalf("expected no thinking, got %+v", req.Thinking)
+				}
+				return
+			}
+			if req.Thinking == nil || req.Thinking.Type != tc.wantType {
+				t.Fatalf("Thinking = %+v, want %q", req.Thinking, tc.wantType)
+			}
+		})
+	}
+}
+
+// TestNewThinkingConfigParsing pins how the `thinking` config field is read:
+// enabled|disabled are kept (case-insensitively), everything else is ignored so
+// an unknown value can never break a request.
+func TestNewThinkingConfigParsing(t *testing.T) {
+	base := provider.Config{Name: "gen", BaseURL: "https://api.example.com/v1", Model: "x", APIKey: "k"}
+	for in, want := range map[string]string{"enabled": "enabled", "DISABLED": "disabled", "adaptive": "", "garbage": "", "": ""} {
+		cfg := base
+		cfg.Extra = map[string]any{"thinking": in}
+		p, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New(thinking=%q): %v", in, err)
+		}
+		if got := p.(*client).thinkingType; got != want {
+			t.Errorf("thinking=%q → thinkingType=%q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestBuildRequestDeepSeekDisabled covers both user-facing ways to turn
+// DeepSeek thinking off. Either input must route to thinking.type=disabled and
+// drop reasoning_effort.
+func TestBuildRequestDeepSeekDisabled(t *testing.T) {
+	base := provider.Config{Name: "ds", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4", APIKey: "k"}
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+	}{
+		{name: "effort-disabled", extra: map[string]any{"effort": "disabled"}},
+		{name: "thinking-disabled", extra: map[string]any{"thinking": "disabled"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base
+			cfg.Extra = tc.extra
+			p, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New(%v): %v", tc.extra, err)
+			}
+			req := p.(*client).buildRequest(provider.Request{})
+			if req.Thinking == nil || req.Thinking.Type != "disabled" {
+				t.Fatalf("Thinking = %+v, want disabled", req.Thinking)
+			}
+			if req.ReasoningEffort != "" {
+				t.Fatalf("disabled DeepSeek must not send reasoning_effort, got %q", req.ReasoningEffort)
+			}
+		})
+	}
+}
+
 func withEffort(c provider.Config, effort string) provider.Config {
 	extra := c.Extra
 	if extra == nil {

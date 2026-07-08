@@ -645,6 +645,7 @@ const PROXY_MODES = ["auto", "custom", "off"] as const;
 // inferred by the backend or edited in TOML for rare gateways.
 const EFFORT_PRESETS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
 const REASONING_PROTOCOLS: readonly string[] = ["", "deepseek", "openai", "none"];
+const THINKING_MODES: readonly string[] = ["", "enabled", "disabled", "adaptive"];
 const PROXY_TYPES = ["http", "https", "socks5", "socks5h"] as const;
 const LANGUAGE_PREFS: LangPref[] = ["", "zh", "en"];
 const AUTO_PLAN_MODES = ["off", "on"] as const;
@@ -675,6 +676,11 @@ function normalizeAutoPlan(mode: string | undefined): AutoPlanMode {
 
 function normalizeReasoningProtocol(protocol: string | undefined): string {
   return REASONING_PROTOCOLS.includes(protocol ?? "") ? protocol ?? "" : "";
+}
+
+function normalizeThinkingMode(thinking: string | undefined): string {
+  const v = String(thinking ?? "").trim().toLowerCase();
+  return THINKING_MODES.includes(v) ? v : "";
 }
 
 export function providerEditorEffectiveKind(isNewCustomProvider: boolean, kind: string, kinds: string[]): string {
@@ -955,6 +961,7 @@ function normalizeProviderView(p: ProviderView): ProviderView {
     headers: normalizeStringMap(p.headers),
     extraBody: normalizeExtraBodyMap(p.extraBody),
     reasoningProtocol: normalizeReasoningProtocol(p.reasoningProtocol),
+    thinking: normalizeThinkingMode(p.thinking),
     supportedEfforts: asArray(p.supportedEfforts),
     modelOverrides: asArray(p.modelOverrides),
     requiresKey,
@@ -1112,6 +1119,19 @@ function reasoningProtocolLabel(protocol: string, t: ReturnType<typeof useT>): s
       return t("settings.reasoningProtocol.none");
     default:
       return t("settings.reasoningProtocol.auto");
+  }
+}
+
+function thinkingModeLabel(mode: string, t: ReturnType<typeof useT>): string {
+  switch (mode) {
+    case "enabled":
+      return t("settings.thinkingMode.enabled");
+    case "disabled":
+      return t("settings.thinkingMode.disabled");
+    case "adaptive":
+      return t("settings.thinkingMode.adaptive");
+    default:
+      return t("settings.thinkingMode.auto");
   }
 }
 
@@ -4569,6 +4589,7 @@ function ProviderEditor({
   // of a bare "0"; saved back as 0.
   const [ctx, setCtx] = useState(initial?.contextWindow ? String(initial.contextWindow) : "");
   const [reasoningProtocol, setReasoningProtocol] = useState(normalizeReasoningProtocol(initial?.reasoningProtocol));
+  const [thinking, setThinking] = useState(normalizeThinkingMode(initial?.thinking));
   const [supportedEfforts] = useState<string[]>(initial?.supportedEfforts ?? []);
   const [defaultEffort] = useState(initial?.defaultEffort ?? "");
   const [fetchingModels, setFetchingModels] = useState(false);
@@ -4634,6 +4655,7 @@ function ProviderEditor({
         balanceUrl: balanceUrl.trim(),
         contextWindow: Number(ctx) || 0,
         reasoningProtocol,
+        thinking,
         supportedEfforts: cleanedSupportedEfforts,
         defaultEffort: cleanDefaultEffort,
         modelOverrides: initial?.modelOverrides ?? [],
@@ -4683,6 +4705,7 @@ function ProviderEditor({
       balanceUrl: balanceUrl.trim(),
       contextWindow: Number(ctx) || 0,
       reasoningProtocol,
+      thinking,
       supportedEfforts: cleanedSupportedEfforts,
       // Clear the stored default if no levels are selected; the backend's
       // NormalizeEffort would otherwise silently ignore an unsupported value.
@@ -4841,6 +4864,15 @@ function ProviderEditor({
           ))}
         </select>
         <div className="mem-hint">{t("settings.reasoningProtocolHint")}</div>
+        <label className="set-label">{t("settings.thinkingMode")}</label>
+        <select className="mem-select" value={thinking} onChange={(e) => setThinking(normalizeThinkingMode(e.target.value))}>
+          {THINKING_MODES.map((mode) => (
+            <option key={mode || "auto"} value={mode}>
+              {thinkingModeLabel(mode, t)}
+            </option>
+          ))}
+        </select>
+        <div className="mem-hint">{t("settings.thinkingModeHint")}</div>
         <label className="set-label">{t("settings.providerBalanceUrl")}</label>
         <input
           className="mem-input"
