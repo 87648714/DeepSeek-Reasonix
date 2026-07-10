@@ -5,6 +5,9 @@
 /npm/.stage/
 /reasonix
 /reasonix.exe
+.reasonix
+.codebuddy
+.gitignore
 
 # Website (Astro) build output
 /site/dist/
