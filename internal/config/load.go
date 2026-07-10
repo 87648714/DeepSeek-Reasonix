@@ -8,8 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/BurntSushi/toml"
-
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/provider"
 )
 
@@ -48,6 +47,14 @@ func LoadForRoot(root string) (*Config, error) {
 	globalMaxSteps := cfg.Agent.MaxSteps
 	globalPlannerMaxSteps := cfg.Agent.PlannerMaxSteps
 	globalMemoryCompiler := cfg.Agent.MemoryCompiler
+	// Deep-copy: TOML decoding writes through an existing *bool rather than
+	// replacing it, so a shallow struct copy would alias the pointer and the
+	// project merge below would mutate the captured global value in place.
+	globalSecrets := cfg.Secrets
+	if cfg.Secrets.RedactToolOutput != nil {
+		v := *cfg.Secrets.RedactToolOutput
+		globalSecrets.RedactToolOutput = &v
+	}
 
 	tomlSources = append(tomlSources, projectTOML)
 	if err := mergeRuntimeTOMLFile(cfg, projectTOML); err != nil {
@@ -59,7 +66,11 @@ func LoadForRoot(root string) (*Config, error) {
 	cfg.Agent.MaxSteps = globalMaxSteps
 	cfg.Agent.PlannerMaxSteps = globalPlannerMaxSteps
 	cfg.Agent.MemoryCompiler = globalMemoryCompiler
-	// toml.DecodeFile replaces [[plugins]] wholesale, so cfg.Plugins now holds
+	// Secret protection is a user-global security control: a cloned repo's
+	// reasonix.toml must not be able to disable redaction or flip on the
+	// workflow-breaking env/path protections.
+	cfg.Secrets = globalSecrets
+	// TOML decoding replaces [[plugins]] wholesale, so cfg.Plugins now holds
 	// only the last file's. Re-merge by name across all sources (later wins) so a
 	// project reasonix.toml doesn't drop the global config's MCP servers.
 	plugins, err := mergeTOMLPlugins(tomlSources)
@@ -93,14 +104,18 @@ func LoadForRoot(root string) (*Config, error) {
 	}
 	cfg.mergeMCPJSON(entries)
 
-	// Lowest priority: the v0.x ~/.reasonix/config.json's mcpServers, so upgrading
-	// from the TypeScript line keeps MCP servers without rewriting them. Anything
-	// the v2 config or .mcp.json already declared wins on a name collision.
-	cfg.mergeMCPJSON(loadLegacyMCP(legacyConfigPath()))
+	// Lowest priority before the one-time v1.9.1 MCP migration: the v0.x
+	// ~/.reasonix/config.json's mcpServers. Once the migration marker exists, the
+	// current config is authoritative even when it is empty; reading the legacy
+	// source again would resurrect servers the user removed from current config.
+	if !mcpGlobalMigrationComplete() {
+		cfg.mergeMCPJSON(loadLegacyMCP(legacyConfigPath()))
+	}
 	_ = mergeInstalledPluginPackages(cfg, root)
 	normalizePluginCommandLines(cfg)
 	normalizeLegacyEffort(cfg)
 	normalizeLegacyMCPTiers(cfg)
+	normalizeLegacyStepFunBaseURLs(cfg)
 	normalizeLegacyMimoCustomProviders(cfg)
 	normalizeLegacyProviderModels(cfg)
 	normalizeDesktopOfficialProviderAccess(cfg)
@@ -258,7 +273,7 @@ func mergeTOMLPlugins(paths []string) ([]PluginEntry, error) {
 			continue
 		}
 		var f Config
-		if _, err := toml.DecodeFile(path, &f); err != nil {
+		if _, err := decodeTOMLFile(path, &f); err != nil {
 			return nil, fmt.Errorf("config %s: %w", path, err)
 		}
 		for _, p := range f.Plugins {
@@ -290,7 +305,7 @@ func mergeTOMLProviders(paths []string) ([]ProviderEntry, map[string]providerSou
 			continue
 		}
 		var f Config
-		if _, err := toml.DecodeFile(path, &f); err != nil {
+		if _, err := decodeTOMLFile(path, &f); err != nil {
 			return nil, nil, nil, false, fmt.Errorf("config %s: %w", path, err)
 		}
 		if len(f.Providers) == 0 {
@@ -343,7 +358,7 @@ func mergeTOMLProviderAccess(paths []string) ([]string, bool, error) {
 			continue
 		}
 		var f Config
-		meta, err := toml.DecodeFile(path, &f)
+		meta, err := decodeTOMLFile(path, &f)
 		if err != nil {
 			return nil, false, fmt.Errorf("config %s: %w", path, err)
 		}
@@ -404,8 +419,8 @@ func loadForEditStrict(path string, loadCredentials bool) (*Config, error) {
 	if err := mergeFile(cfg, path); err != nil {
 		return nil, err
 	}
-	migratedMimo := normalizeConfigForEdit(cfg)
-	if migratedMimo && strings.TrimSpace(path) != "" {
+	changed := normalizeConfigForEdit(cfg)
+	if changed && strings.TrimSpace(path) != "" {
 		if _, err := os.Stat(path); err == nil {
 			if err := cfg.SaveTo(path); err != nil {
 				return nil, err
@@ -419,13 +434,14 @@ func normalizeConfigForEdit(cfg *Config) bool {
 	normalizePluginCommandLines(cfg)
 	normalizeLegacyEffort(cfg)
 	normalizeLegacyMCPTiers(cfg)
-	migratedMimo := normalizeLegacyMimoCustomProviders(cfg)
+	changed := normalizeLegacyStepFunBaseURLs(cfg)
+	changed = normalizeLegacyMimoCustomProviders(cfg) || changed
 	normalizeLegacyProviderModels(cfg)
 	normalizeDesktopOfficialProviderAccess(cfg)
 	applyDeepSeekOfficialDefaultPricing(cfg)
 	backfillDeepSeekOfficialPrices(cfg)
 	normalizeEffortConfig(cfg)
-	return migratedMimo
+	return changed
 }
 
 func loadDotEnvForEditPath(path string) {
@@ -442,7 +458,7 @@ func mergeFile(cfg *Config, path string) error {
 	if _, err := os.Stat(path); err != nil {
 		return nil
 	}
-	if _, err := toml.DecodeFile(path, cfg); err != nil {
+	if _, err := decodeTOMLFile(path, cfg); err != nil {
 		return fmt.Errorf("config %s: %w", path, err)
 	}
 	return nil
@@ -474,7 +490,7 @@ func migrateLegacyMCPTiersFile(path string) error {
 	if err != nil {
 		return err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return err
 	}
@@ -546,6 +562,43 @@ func normalizeLegacyProviderModels(c *Config) {
 			p.Model = model
 		}
 	}
+}
+
+const (
+	legacyStepFunOpenAIBaseURL      = "https://api.stepfun.ai/step_plan/v1"
+	officialStepFunOpenAIBaseURL    = "https://api.stepfun.com/step_plan/v1"
+	legacyStepFunAnthropicBaseURL   = "https://api.stepfun.ai/step_plan"
+	officialStepFunAnthropicBaseURL = "https://api.stepfun.com/step_plan"
+)
+
+func normalizeLegacyStepFunBaseURLs(c *Config) bool {
+	if c == nil {
+		return false
+	}
+	changed := false
+	for i := range c.Providers {
+		p := &c.Providers[i]
+		switch {
+		case isLegacyStepFunPresetProvider(*p, "stepfun", "openai") && normalizedBaseURLForMigration(p.BaseURL) == legacyStepFunOpenAIBaseURL:
+			p.BaseURL = officialStepFunOpenAIBaseURL
+			changed = true
+		case isLegacyStepFunPresetProvider(*p, "stepfun-anthropic", "anthropic") && normalizedBaseURLForMigration(p.BaseURL) == legacyStepFunAnthropicBaseURL:
+			p.BaseURL = officialStepFunAnthropicBaseURL
+			changed = true
+		}
+	}
+	return changed
+}
+
+func isLegacyStepFunPresetProvider(p ProviderEntry, id, kind string) bool {
+	if !strings.EqualFold(strings.TrimSpace(p.Kind), kind) {
+		return false
+	}
+	return strings.TrimSpace(p.Name) == id || strings.TrimSpace(p.PresetID) == id
+}
+
+func normalizedBaseURLForMigration(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(raw), "/")
 }
 
 func normalizeLegacyMimoProviderCatalogs(c *Config) bool {

@@ -136,6 +136,9 @@ func (a *App) InstallPlugin(source string, opts PluginInstallOptions) (string, e
 	}
 	a.invalidateSkillRootsCache()
 	if rebuildErr := a.rebuild(); rebuildErr != nil {
+		if _, ok := a.deferredRebuildWarning("plugins", rebuildErr); ok {
+			return out, nil
+		}
 		return out, rebuildErr
 	}
 	return out, nil
@@ -153,15 +156,20 @@ func (a *App) RemovePlugin(name string) error {
 			if tab == nil || tab.Ctrl == nil {
 				return false
 			}
-			removed, _ := tab.Ctrl.RemoveMCPServer(serverName)
-			return removed
+			return tab.Ctrl.DisconnectMCPServer(serverName)
 		},
 	})
 	if _, err := tl.Execute(context.Background(), raw); err != nil {
 		return err
 	}
 	a.invalidateSkillRootsCache()
-	return a.rebuild()
+	if err := a.rebuild(); err != nil {
+		if _, ok := a.deferredRebuildWarning("plugins", err); ok {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *App) SetPluginEnabled(name string, enabled bool) error {
@@ -172,7 +180,13 @@ func (a *App) SetPluginEnabled(name string, enabled bool) error {
 		return err
 	}
 	a.invalidateSkillRootsCache()
-	return a.rebuild()
+	if err := a.rebuild(); err != nil {
+		if _, ok := a.deferredRebuildWarning("plugins", err); ok {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *App) UpdatePlugin(name string) (string, error) {

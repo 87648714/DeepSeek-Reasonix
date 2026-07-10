@@ -33,12 +33,6 @@
   <a href="https://discord.gg/XF78rEME2D"><img src="https://img.shields.io/badge/discord-join-5865F2.svg?style=flat-square&labelColor=161b22&logo=discord&logoColor=white" alt="Discord"/></a>
 </p>
 
-<p align="center">
-  <a href="https://oosmetrics.com/repo/esengine/reasonix"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/9e931d80-2050-4b10-902e-44970cc133ad.svg" alt="oosmetrics — Top 2 in Agents by velocity"/></a>
-  <a href="https://oosmetrics.com/repo/esengine/reasonix"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/556d94b3-61b7-486b-baf2-888b9327deab.svg" alt="oosmetrics — Top 3 in LLMs by velocity"/></a>
-  <a href="https://oosmetrics.com/repo/esengine/reasonix"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/0f457d4c-efca-4d15-ad2b-139691ff342c.svg" alt="oosmetrics — Top 3 in CLI by velocity"/></a>
-</p>
-
 <br/>
 
 <h3 align="center">A DeepSeek-native AI coding agent for your terminal.</h3>
@@ -137,6 +131,8 @@ commands, `@` references, and two-model setup are all in the
   from the desktop app, then use approvals, YOLO, and commands from IM.
 - **[Spec](./docs/SPEC.md)** — engineering contract: architecture, registries,
   data types, and roadmap.
+- **[Task contracts & pause policy](./docs/TASK_CONTRACT.md)** — structure
+  complex requests with context, output boundaries, constraints, and when to ask.
 - **[Tool contract](./docs/TOOL_CONTRACT.md)** — provider-visible built-in tool
   names, read-only flags, and schema snapshot guard.
 - **[Migrating from 0.x](./docs/MIGRATING.md)** — moving from the legacy
@@ -173,20 +169,19 @@ If Reasonix has been useful and you'd like to say thanks, you can. It stays a co
 
 ## Acknowledgments
 
-A small list of folks whose work has shaped Reasonix the most — measured
-by both commit count and code volume. **Listed alphabetically, no ordering
-of importance.** The full contributor graph is on
-[GitHub](https://github.com/esengine/DeepSeek-Reasonix/graphs/contributors).
+A small list of folks whose work has shaped Reasonix the most — the current top
+20 contributors by commit count. The full contributor graph is on
+[GitHub](https://github.com/esengine/DeepSeek-Reasonix/graphs/contributors?all=1).
 
-- [**ctharvey**](https://github.com/ctharvey)
-- [**dimasd-angga**](https://github.com/dimasd-angga) (Dimas D. Angga)
-- [**Evan-Pycraft**](https://github.com/Evan-Pycraft)
-- [**ForeverYoungPp**](https://github.com/ForeverYoungPp)
-- [**GTC2080**](https://github.com/GTC2080) (TaoMu)
-- [**kabaka9527**](https://github.com/kabaka9527)
-- [**lisniuse**](https://github.com/lisniuse) (Richie)
-- [**wade19990814-hue**](https://github.com/wade19990814-hue)
-- [**wviana**](https://github.com/wviana) (Wesley Viana)
+<!-- reasonix-top-contributors:start -->
+| Contributor | Contributor | Contributor | Contributor |
+| --- | --- | --- | --- |
+| [**SivanCola**](https://github.com/SivanCola) | [**esengine**](https://github.com/esengine) | [**ttmouse**](https://github.com/ttmouse) | [**lifu963**](https://github.com/lifu963) |
+| **reasonix** (anonymous) | [**HUQIANTAO**](https://github.com/HUQIANTAO) | [**GTC2080**](https://github.com/GTC2080) | [**light-front-theory**](https://github.com/light-front-theory) |
+| **merge-order-check** (anonymous) | [**Li-Charles-One**](https://github.com/Li-Charles-One) | [**eghrhegpe**](https://github.com/eghrhegpe) | **wufengfan** (anonymous) |
+| [**CVEngineer66**](https://github.com/CVEngineer66) | [**dependabot\[bot\]**](https://github.com/apps/dependabot) | [**lanshi17**](https://github.com/lanshi17) | [**SuMuxi66**](https://github.com/SuMuxi66) |
+| [**CnsMaple**](https://github.com/CnsMaple) | [**cyq1017**](https://github.com/cyq1017) | [**JesonChou**](https://github.com/JesonChou) | [**XTLine**](https://github.com/XTLine) |
+<!-- reasonix-top-contributors:end -->
 
 Also a separate thank-you to [**Bernardxu123**](https://github.com/Bernardxu123)
 for designing the project logo, and to

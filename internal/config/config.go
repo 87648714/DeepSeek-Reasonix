@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/netclient"
 	"reasonix/internal/provider"
 )
@@ -59,10 +60,40 @@ type Config struct {
 	LSP              LSPConfig           `toml:"lsp"`
 	Bot              BotConfig           `toml:"bot"`
 	Serve            ServeConfig         `toml:"serve"`
+	Secrets          SecretsConfig       `toml:"secrets"`
 
 	providerSources          map[string]providerSourceScope
 	shadowedProjectProviders []ProviderEntry
 	expansionEnv             map[string]string
+	pluginPackageOwners      map[string]string
+}
+
+// SecretsConfig controls the credential protection layers. It is a user-global
+// setting: project reasonix.toml values are ignored (see LoadForRoot), so a
+// cloned repository cannot silently switch off redaction or opt the user into
+// workflow-breaking protections.
+type SecretsConfig struct {
+	// RedactToolOutput masks credential-shaped values in tool output before it
+	// enters model context and UI events. Nil keeps the default enabled.
+	// Session transcripts and background-job artifacts on disk are always
+	// redacted, regardless of this switch.
+	RedactToolOutput *bool `toml:"redact_tool_output"`
+	// FilterSubprocessEnv strips credential-like environment variables
+	// (*_API_KEY, *TOKEN*, *SECRET*, ...) from tool subprocesses (bash, hooks,
+	// LSP, MCP stdio). Default off: it breaks token-based workflows such as
+	// `gh`, HTTPS `git push`, and `npm publish`.
+	FilterSubprocessEnv bool `toml:"filter_subprocess_env"`
+	// ProtectSensitiveFiles makes read/list/search tools treat credential
+	// paths (.env, .git-credentials, .netrc, *.pem/*.key/*.p12/*.pfx, ~/.ssh)
+	// as invisible. Default off: output redaction already masks the values,
+	// and hiding the files breaks legitimate "edit my .env" workflows.
+	ProtectSensitiveFiles bool `toml:"protect_sensitive_files"`
+}
+
+// SecretsRedactToolOutput reports whether live tool output redaction is
+// enabled (default true).
+func (c *Config) SecretsRedactToolOutput() bool {
+	return c == nil || c.Secrets.RedactToolOutput == nil || *c.Secrets.RedactToolOutput
 }
 
 type providerSourceScope string
@@ -482,36 +513,109 @@ type StatuslineConfig struct {
 
 // BotConfig 控制多渠道 IM bot 消息网关。
 type BotConfig struct {
-	Enabled          bool                  `toml:"enabled"`
-	Model            string                `toml:"model"` // 用于 bot 的模型名，空则用 default_model
-	ToolApprovalMode string                `toml:"tool_approval_mode"`
-	MaxSteps         int                   `toml:"max_steps"`
-	DebounceMs       int                   `toml:"debounce_ms"` // 消息合并窗口，毫秒
-	Allowlist        BotAllowlist          `toml:"allowlist"`
-	QQ               QQBotConfig           `toml:"qq"`
-	Feishu           FeishuBotConfig       `toml:"feishu"`
-	Weixin           WeixinBotConfig       `toml:"weixin"`
-	Connections      []BotConnectionConfig `toml:"connections"`
+	Enabled            bool                  `toml:"enabled"`
+	Model              string                `toml:"model"` // 用于 bot 的模型名，空则用 default_model
+	ToolApprovalMode   string                `toml:"tool_approval_mode"`
+	MaxSteps           int                   `toml:"max_steps"`
+	DebounceMs         int                   `toml:"debounce_ms"` // 消息合并窗口，毫秒
+	QueueMode          string                `toml:"queue_mode"`  // steer|followup|collect|interrupt
+	QueueCap           int                   `toml:"queue_cap"`
+	QueueDrop          string                `toml:"queue_drop"` // summarize|old|new
+	IgnoreSelfMessages bool                  `toml:"ignore_self_messages"`
+	SelfUserIDs        BotSelfUserIDs        `toml:"self_user_ids"`
+	Control            BotControlConfig      `toml:"control"`
+	Pairing            BotPairingConfig      `toml:"pairing"`
+	Allowlist          BotAllowlist          `toml:"allowlist"`
+	QQ                 QQBotConfig           `toml:"qq"`
+	Feishu             FeishuBotConfig       `toml:"feishu"`
+	Weixin             WeixinBotConfig       `toml:"weixin"`
+	Routes             []BotRouteConfig      `toml:"routes"`
+	Connections        []BotConnectionConfig `toml:"connections"`
+	// DesktopWatchers persists /desktop watch subscriptions so god-view
+	// notifications survive a desktop restart. Managed by the desktop bot
+	// bridge, not the settings UI.
+	DesktopWatchers []BotDesktopWatcherConfig `toml:"desktop_watchers"`
+}
+
+// BotDesktopWatcherConfig is one bot chat subscribed to desktop events
+// (/desktop watch on).
+type BotDesktopWatcherConfig struct {
+	Platform     string `toml:"platform"`
+	ConnectionID string `toml:"connection_id"`
+	Domain       string `toml:"domain"`
+	ChatType     string `toml:"chat_type"`
+	ChatID       string `toml:"chat_id"`
+}
+
+type BotSelfUserIDs struct {
+	QQ     []string `toml:"qq"`
+	Feishu []string `toml:"feishu"`
+	Weixin []string `toml:"weixin"`
+}
+
+type BotControlConfig struct {
+	Enabled  bool   `toml:"enabled"`
+	Addr     string `toml:"addr"`
+	TokenEnv string `toml:"token_env"`
+}
+
+type BotRouteConfig struct {
+	ConnectionID     string `toml:"connection_id"`
+	Platform         string `toml:"platform"`
+	ChatType         string `toml:"chat_type"`
+	ChatID           string `toml:"chat_id"`
+	UserID           string `toml:"user_id"`
+	ThreadID         string `toml:"thread_id"`
+	Model            string `toml:"model"`
+	ToolApprovalMode string `toml:"tool_approval_mode"`
+	WorkspaceRoot    string `toml:"workspace_root"`
 }
 
 // BotAllowlist 控制哪些用户可以使用 bot。
 type BotAllowlist struct {
-	Enabled      bool     `toml:"enabled"`
-	AllowAll     bool     `toml:"allow_all"`
-	QQUsers      []string `toml:"qq_users"`
-	FeishuUsers  []string `toml:"feishu_users"`
-	WeixinUsers  []string `toml:"weixin_users"`
-	QQGroups     []string `toml:"qq_groups"`
-	FeishuGroups []string `toml:"feishu_groups"`
-	WeixinGroups []string `toml:"weixin_groups"`
+	Enabled         bool     `toml:"enabled"`
+	AllowAll        bool     `toml:"allow_all"`
+	QQUsers         []string `toml:"qq_users"`
+	FeishuUsers     []string `toml:"feishu_users"`
+	WeixinUsers     []string `toml:"weixin_users"`
+	QQApprovers     []string `toml:"qq_approvers"`
+	FeishuApprovers []string `toml:"feishu_approvers"`
+	WeixinApprovers []string `toml:"weixin_approvers"`
+	QQAdmins        []string `toml:"qq_admins"`
+	FeishuAdmins    []string `toml:"feishu_admins"`
+	WeixinAdmins    []string `toml:"weixin_admins"`
+	QQGroups        []string `toml:"qq_groups"`
+	FeishuGroups    []string `toml:"feishu_groups"`
+	WeixinGroups    []string `toml:"weixin_groups"`
+}
+
+type BotPairingConfig struct {
+	Enabled               bool `toml:"enabled"`
+	RequestTTLMinutes     int  `toml:"request_ttl_minutes"`
+	MaxPendingPerPlatform int  `toml:"max_pending_per_platform"`
+}
+
+// BotAccessConfig controls who may use one concrete bot connection.
+type BotAccessConfig struct {
+	Enabled        bool     `toml:"enabled"`
+	AllowAll       bool     `toml:"allow_all"`
+	PairingEnabled bool     `toml:"pairing_enabled"`
+	Users          []string `toml:"users"`
+	Groups         []string `toml:"groups"`
+	Approvers      []string `toml:"approvers"`
+	Admins         []string `toml:"admins"`
 }
 
 // QQBotConfig QQ 官方 Bot API v2 配置。
 type QQBotConfig struct {
-	Enabled      bool   `toml:"enabled"`
-	AppID        string `toml:"app_id"`
-	AppSecretEnv string `toml:"app_secret_env"` // 环境变量名，如 QQ_BOT_APP_SECRET
-	Sandbox      bool   `toml:"sandbox"`        // true 使用 QQ 沙箱 API / gateway
+	Enabled          bool            `toml:"enabled"`
+	AppID            string          `toml:"app_id"`
+	AppSecretEnv     string          `toml:"app_secret_env"` // 环境变量名，如 QQ_BOT_APP_SECRET
+	Sandbox          bool            `toml:"sandbox"`        // true 使用 QQ 沙箱 API / gateway
+	Model            string          `toml:"model"`
+	ToolApprovalMode string          `toml:"tool_approval_mode"`
+	WorkspaceRoot    string          `toml:"workspace_root"`
+	Access           BotAccessConfig `toml:"access"`
 }
 
 // FeishuBotConfig 飞书自建应用 Bot 配置。
@@ -524,6 +628,11 @@ type FeishuBotConfig struct {
 	Mode              string `toml:"mode"`               // webhook（默认）| websocket
 	WebhookPort       int    `toml:"webhook_port"`       // webhook 模式端口
 	RequireMention    bool   `toml:"require_mention"`
+	// OutboundMediaRoots contains absolute local directories the loopback /send
+	// control API may attach files from. Media refs must be bare filenames and
+	// must exist in exactly one configured root. Empty (the default) disables
+	// outbound file sending.
+	OutboundMediaRoots []string `toml:"outbound_media_roots"`
 }
 
 // WeixinBotConfig 微信 iLink Bot 配置。
@@ -548,6 +657,7 @@ type BotConnectionConfig struct {
 	Model            string                        `toml:"model"`
 	ToolApprovalMode string                        `toml:"tool_approval_mode"`
 	WorkspaceRoot    string                        `toml:"workspace_root"`
+	Access           BotAccessConfig               `toml:"access"`
 	Credential       BotConnectionCredential       `toml:"credential"`
 	SessionMappings  []BotConnectionSessionMapping `toml:"session_mappings"`
 	LastError        string                        `toml:"last_error"`
@@ -777,9 +887,9 @@ type SandboxConfig struct {
 	WorkspaceRoot string   `toml:"workspace_root"`
 	AllowWrite    []string `toml:"allow_write"`
 	ForbidRead    []string `toml:"forbid_read"`
-	// Bash is the OS-sandbox mode for the bash tool: "enforce" (default) jails
-	// each command, "off" runs it unconfined. Phase 1; macOS only for now, with
-	// a graceful fallback elsewhere (see internal/sandbox).
+	// Bash is the OS-sandbox mode for the bash tool: "enforce" jails each
+	// command when an OS sandbox is available and refuses bash otherwise; "off"
+	// runs it unconfined. Empty uses the platform default.
 	Bash string `toml:"bash"`
 	// Network allows network egress from inside the bash sandbox. Defaults true
 	// so module/package downloads keep working; the boundary is then writes.
@@ -819,6 +929,20 @@ func (c *Config) WriteRootsForRoot(fallbackRoot string) []string {
 	return roots
 }
 
+// AllowWriteRoots returns only the configured [sandbox] allow_write extras with
+// ${VAR} expanded — the explicit escape-hatch entries, without the workspace
+// root that WriteRoots prepends. The session-data write guard treats these as
+// user-sanctioned raw access.
+func (c *Config) AllowWriteRoots() []string {
+	var roots []string
+	for _, d := range c.Sandbox.AllowWrite {
+		if d = c.expandVars(d); d != "" {
+			roots = append(roots, d)
+		}
+	}
+	return roots
+}
+
 // ForbidReadRoots returns the directories the agent is forbidden from reading
 // or listing, with ${VAR} expanded. Relative roots are resolved against the
 // current working directory; the confiner resolves them to symlink-free paths.
@@ -850,14 +974,30 @@ func (c *Config) ForbidReadRootsForRoot(fallbackRoot string) []string {
 	return roots
 }
 
-// BashMode normalises the bash-sandbox mode: only an explicit "off" disables
-// it; empty or any other value resolves to "enforce", so the sandbox is on by
-// default and fails safe.
+// BashMode normalises the bash-sandbox mode for the current host.
 func (c *Config) BashMode() string {
-	if c.Sandbox.Bash == "off" {
+	return c.BashModeForGOOS(runtimeGOOS)
+}
+
+// BashModeForGOOS normalises the bash-sandbox mode for tests and cross-platform
+// rendering. Windows currently forces bash sandboxing off, even when older
+// configs explicitly requested "enforce", because the native backend still
+// breaks common Git Bash/MSYS2, Docker, and git workflows. macOS/Linux keep the
+// existing explicit-mode behavior.
+func (c *Config) BashModeForGOOS(goos string) string {
+	if goos == "windows" {
 		return "off"
 	}
-	return "enforce"
+	switch strings.TrimSpace(c.Sandbox.Bash) {
+	case "enforce":
+		return "enforce"
+	case "off":
+		return "off"
+	case "":
+		return "enforce"
+	default:
+		return "enforce"
+	}
 }
 
 // AgentConfig configures the harness loop. PlannerModel is optional: when set
@@ -910,6 +1050,10 @@ type AgentConfig struct {
 	// PlanModeAllowedTools names extra custom tools the plan-mode policy may treat
 	// as read-only. It cannot unlock known blocked tools or unsafe bash commands.
 	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
+	// PlanModeReadOnlyCommands names concrete shell command prefixes that plan mode
+	// may treat as read-only. Shell operators, background execution, and shell
+	// interpreter prefixes remain blocked.
+	PlanModeReadOnlyCommands []string `toml:"plan_mode_read_only_commands"`
 	// MemoryCompiler controls the v5 execution-memory compiler. Missing configs
 	// default to enabled so users get the self-improving planner unless they opt
 	// out explicitly.
@@ -972,8 +1116,11 @@ type ProviderEntry struct {
 	ModelsURL      string            `toml:"models_url"` // auto-fetch models from this URL on startup
 	Default        string            `toml:"default"`    // default model when Models is set (else Models[0])
 	APIKeyEnv      string            `toml:"api_key_env"`
-	Headers        map[string]string `toml:"headers"`    // optional extra HTTP headers for OpenAI-compatible gateways; secrets should stay in api_key_env.
-	ExtraBody      map[string]any    `toml:"extra_body"` // optional extra top-level JSON request body fields for OpenAI-compatible gateways.
+	PresetID       string            `toml:"preset_id"`      // curated preset identity; UI-only metadata, not sent to model providers.
+	PresetVersion  int               `toml:"preset_version"` // curated preset schema version for future migrations.
+	Headers        map[string]string `toml:"headers"`        // optional extra HTTP headers for compatible gateways; secrets should stay in api_key_env.
+	ExtraBody      map[string]any    `toml:"extra_body"`     // optional extra top-level JSON request body fields for OpenAI-compatible gateways.
+	AuthHeader     bool              `toml:"auth_header"`    // for Anthropic-compatible gateways that expect Authorization: Bearer instead of x-api-key.
 	resolvedAPIKey string
 	resolvedSource CredentialSource
 	BalanceURL     string                       `toml:"balance_url"` // optional; a provider-specific wallet-balance endpoint (DeepSeek: https://api.deepseek.com/user/balance). Empty = no balance readout.
@@ -1393,7 +1540,7 @@ const LanguagePolicy = `Reply in the same language the user is using in their mo
 // Default returns the built-in default configuration.
 func Default() *Config {
 	return &Config{
-		ConfigVersion:    3,
+		ConfigVersion:    4,
 		DefaultModel:     "deepseek-flash",
 		CredentialsStore: CredentialsStoreAuto,
 		UI:               UIConfig{Theme: "auto"},
@@ -1422,23 +1569,29 @@ func Default() *Config {
 		// resolves to allow) while `reasonix` prompts before writers. Users add
 		// deny/allow rules to harden or quiet specific tools.
 		Permissions: PermissionsConfig{Mode: "ask"},
-		// Sandbox on by default: bash is jailed (macOS), network allowed so
-		// builds/downloads work. Set bash = "off" to disable. Network=true here
-		// so an absent [sandbox] in a user's file keeps egress (zero value would
-		// wrongly deny it).
-		Sandbox: SandboxConfig{Bash: "enforce", Network: true},
+		// Sandbox uses platform defaults: macOS/Linux jail bash by default;
+		// Windows forces bash off until the native sandbox backend is reliable.
+		// Network=true here so an absent [sandbox] in a user's file keeps egress
+		// (zero value would wrongly deny it).
+		Sandbox: SandboxConfig{Network: true},
 		// LSP tools on by default, but dormant until a language server is on PATH;
 		// a missing server yields an install hint rather than an error.
 		LSP:     LSPConfig{Enabled: true},
 		Network: NetworkConfig{ProxyMode: netclient.ModeAuto},
 		Bot: BotConfig{
-			ToolApprovalMode: "ask",
-			MaxSteps:         25,
-			DebounceMs:       1500,
-			Allowlist:        BotAllowlist{Enabled: true},
-			QQ:               QQBotConfig{AppSecretEnv: "QQ_BOT_APP_SECRET"},
-			Feishu:           FeishuBotConfig{Domain: "feishu", AppSecretEnv: "FEISHU_BOT_APP_SECRET", Mode: "webhook", WebhookPort: 8080, RequireMention: true},
-			Weixin:           WeixinBotConfig{AccountID: "default", TokenEnv: "WEIXIN_BOT_TOKEN", APIBase: "https://ilinkai.weixin.qq.com"},
+			ToolApprovalMode:   "ask",
+			MaxSteps:           25,
+			DebounceMs:         1500,
+			QueueMode:          "steer",
+			QueueCap:           20,
+			QueueDrop:          "summarize",
+			IgnoreSelfMessages: true,
+			Control:            BotControlConfig{Addr: "127.0.0.1:37913", TokenEnv: "REASONIX_BOT_CONTROL_TOKEN"},
+			Pairing:            BotPairingConfig{Enabled: true, RequestTTLMinutes: 60, MaxPendingPerPlatform: 3},
+			Allowlist:          BotAllowlist{Enabled: true},
+			QQ:                 QQBotConfig{AppSecretEnv: "QQ_BOT_APP_SECRET"},
+			Feishu:             FeishuBotConfig{Domain: "feishu", AppSecretEnv: "FEISHU_BOT_APP_SECRET", Mode: "webhook", WebhookPort: 8080, RequireMention: true},
+			Weixin:             WeixinBotConfig{AccountID: "default", TokenEnv: "WEIXIN_BOT_TOKEN", APIBase: "https://ilinkai.weixin.qq.com"},
 		},
 		Providers: []ProviderEntry{
 			{Name: "deepseek-flash", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: deepSeekV4FlashPrice()},
@@ -1655,7 +1808,7 @@ func (c *Config) ResolveSystemPromptForRoot(root string) (string, error) {
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(resolveRoot(root), path)
 		}
-		b, err := os.ReadFile(path)
+		b, err := fileencoding.ReadFileUTF8(path)
 		if err != nil {
 			return "", fmt.Errorf("system_prompt_file: %w", err)
 		}

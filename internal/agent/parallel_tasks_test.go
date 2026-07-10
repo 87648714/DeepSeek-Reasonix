@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,9 +15,13 @@ import (
 	"reasonix/internal/tool"
 )
 
-func TestParallelTasksToolIsWriteCapable(t *testing.T) {
-	if (&ParallelTasksTool{}).ReadOnly() {
-		t.Fatal("parallel_tasks must be write-capable because spawned sub-agents can invoke writer tools")
+func TestParallelTasksToolIsReadOnly(t *testing.T) {
+	p := &ParallelTasksTool{}
+	if !p.ReadOnly() {
+		t.Fatal("parallel_tasks must be read-only because spawned sub-agents receive only read-only tools")
+	}
+	if !p.PlanModeSafe() {
+		t.Fatal("parallel_tasks must be plan-mode safe because spawned sub-agents receive only read-only tools")
 	}
 }
 
@@ -45,22 +51,22 @@ func TestParallelTasksValidatesAllTasksBeforeRuntimeLookup(t *testing.T) {
 	}
 }
 
-func TestParallelTasksRejectsDependencyCyclesBeforeRuntimeLookup(t *testing.T) {
+func TestParallelTasksRejectsHiddenDependencyFieldBeforeRuntimeLookup(t *testing.T) {
 	tool := &ParallelTasksTool{}
 	_, err := tool.Execute(context.Background(), json.RawMessage(`{
 		"tasks": [
 			{"prompt": "first", "depends_on": [1]},
-			{"prompt": "second", "depends_on": [0]}
+			{"prompt": "second"}
 		]
 	}`))
 	if err == nil {
-		t.Fatal("Execute returned nil error for cyclic dependencies")
+		t.Fatal("Execute returned nil error for a hidden dependency field")
 	}
-	if !strings.Contains(err.Error(), "cycle") {
-		t.Fatalf("Execute error = %v, want dependency cycle validation", err)
+	if !strings.Contains(err.Error(), "depends_on") {
+		t.Fatalf("Execute error = %v, want hidden dependency field rejection", err)
 	}
 	if strings.Contains(err.Error(), "background jobs are not available") {
-		t.Fatalf("Execute looked up background jobs before validating dependencies: %v", err)
+		t.Fatalf("Execute looked up background jobs before rejecting hidden dependencies: %v", err)
 	}
 }
 
@@ -95,6 +101,69 @@ func TestParallelTasksForegroundCompletesAndClosesWorkers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("parallel_tasks foreground execution did not return; workers likely waited on spawnCh forever")
+	}
+}
+
+func TestParallelTasksInjectsWorkspaceContextIntoChildren(t *testing.T) {
+	workspace := t.TempDir()
+	task := NewTaskTool(promptRoutingProvider{}, nil, tool.NewRegistry(), 20, 0, 0, 0, 0, 0, 0, 0.0, "", "sys", nil, 0, "", "", nil).
+		WithTranscripts(NewSubagentStore(t.TempDir()), workspace, "base-model", "base-effort")
+	parallel := NewParallelTasksTool(task, tool.NewRegistry())
+	ctx := withCallContext(context.Background(), "parallel-call", event.Discard, nil, false)
+
+	out, err := parallel.Execute(ctx, json.RawMessage(`{"tasks":[{"prompt":"inspect one"},{"prompt":"inspect two"}]}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out, "Current workspace: "+strconv.Quote(workspace)) ||
+		!strings.Contains(out, `prefer "." or relative paths`) ||
+		!strings.Contains(out, "inspect one ok") ||
+		!strings.Contains(out, "inspect two ok") {
+		t.Fatalf("parallel output = %q, want child workspace context and prompt", out)
+	}
+}
+
+// TestParallelTasksInheritLanguagePreferencesFromContext pins parallel children
+// to the same transient language injection the task tool applies: both the
+// response- and reasoning-language blocks must reach each child's user turn.
+func TestParallelTasksInheritLanguagePreferencesFromContext(t *testing.T) {
+	task := newTestTaskTool(t, promptRoutingProvider{}, tool.NewRegistry(), "sys", "", "", nil)
+	parallel := NewParallelTasksTool(task, tool.NewRegistry())
+	ctx := withCallContext(context.Background(), "parallel-call", event.Discard, nil, false)
+	ctx = WithResponseLanguagePreference(ctx, "zh")
+	ctx = WithReasoningLanguagePreference(ctx, "zh")
+
+	out, err := parallel.Execute(ctx, json.RawMessage(`{"tasks":[{"prompt":"inspect one"},{"prompt":"inspect two"}]}`))
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out, "<response-language>") || !strings.Contains(out, "<reasoning-language>") {
+		t.Fatalf("parallel output = %q, want response/reasoning language blocks injected into child prompts", out)
+	}
+}
+
+func TestParallelTasksDoesNotExposeWriterToolsToChildren(t *testing.T) {
+	var writerCalls int32
+	parentReg := tool.NewRegistry()
+	parentReg.Add(fakeTool{name: "write_file", readOnly: false, calls: &writerCalls})
+	task := newTestTaskTool(t, writerCallingProvider{}, parentReg, "sys", "", "", nil)
+	parallel := NewParallelTasksTool(task, parentReg)
+	ctx := withCallContext(context.Background(), "parallel-call", event.Discard, nil, false)
+
+	out, err := parallel.Execute(ctx, json.RawMessage(`{
+		"tasks": [
+			{"prompt": "try writer one"},
+			{"prompt": "try writer two"}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("Execute returned error: %v\n%s", err, out)
+	}
+	if got := atomic.LoadInt32(&writerCalls); got != 0 {
+		t.Fatalf("writer tool was exposed to read-only sub-agents and called %d times", got)
+	}
+	if !strings.Contains(out, "Completed 2 parallel tasks") {
+		t.Fatalf("missing aggregate output: %s", out)
 	}
 }
 
@@ -170,6 +239,59 @@ func (promptRoutingProvider) Stream(_ context.Context, req provider.Request) (<-
 	return ch, nil
 }
 
+type writerCallingProvider struct{}
+
+func (writerCallingProvider) Name() string { return "writer-calling" }
+
+func (writerCallingProvider) Stream(_ context.Context, req provider.Request) (<-chan provider.Chunk, error) {
+	ch := make(chan provider.Chunk, 2)
+	if !hasToolResult(req, "write_file") {
+		ch <- toolCallChunk("write-1", "write_file", `{"path":"x","content":"y"}`)
+		ch <- provider.Chunk{Type: provider.ChunkDone}
+		close(ch)
+		return ch, nil
+	}
+	ch <- provider.Chunk{Type: provider.ChunkText, Text: "writer unavailable"}
+	ch <- provider.Chunk{Type: provider.ChunkDone}
+	close(ch)
+	return ch, nil
+}
+
+func hasToolResult(req provider.Request, name string) bool {
+	for _, m := range req.Messages {
+		if m.Role == provider.RoleTool && m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 type stringsError string
 
 func (e stringsError) Error() string { return string(e) }
+
+// TestChildMaxStepsSharedDefault pins the single step-budget rule shared by
+// task, read_only_task, and parallel_tasks children: explicit request wins,
+// a finite parent yields half its budget (min 5), an unbounded parent yields
+// an unbounded child. parallel_tasks used to hardcode 20 instead.
+func TestChildMaxStepsSharedDefault(t *testing.T) {
+	cases := []struct {
+		name      string
+		parent    int
+		requested int
+		want      int
+	}{
+		{"explicit request wins", 30, 7, 7},
+		{"finite parent halves", 30, 0, 15},
+		{"half is floored at 5", 8, 0, 5},
+		{"unbounded parent stays unbounded", 0, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			task := &TaskTool{maxSteps: tc.parent}
+			if got := task.childMaxSteps(tc.requested); got != tc.want {
+				t.Fatalf("childMaxSteps(parent=%d, requested=%d) = %d, want %d", tc.parent, tc.requested, got, tc.want)
+			}
+		})
+	}
+}

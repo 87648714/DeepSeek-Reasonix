@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -251,6 +252,27 @@ func TestBuildRequestThinking(t *testing.T) {
 	}
 }
 
+func TestBuildRequestThinkingEnabledGateway(t *testing.T) {
+	c := &client{model: "LongCat-2.0", thinking: "enabled", effort: "disabled"}
+	r := c.buildRequest(provider.Request{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: "hi"},
+			{Role: provider.RoleAssistant, Content: "ok", ReasoningContent: "signed reasoning", ReasoningSignature: "sig"},
+		},
+	})
+	if r.Thinking == nil || r.Thinking.Type != "disabled" || r.Thinking.Display != "" {
+		t.Fatalf("thinking config = %+v, want disabled without display", r.Thinking)
+	}
+	if r.OutputConfig != nil {
+		t.Fatalf("enabled/disabled gateway thinking must omit output_config: %+v", r.OutputConfig)
+	}
+	for _, block := range r.Messages[1].Content {
+		if block.Type == "thinking" {
+			t.Fatalf("enabled/disabled gateway must not replay Anthropic signed thinking blocks: %+v", r.Messages[1])
+		}
+	}
+}
+
 // TestBuildRequestThinkingOff is the default: no thinking field, and reasoning is
 // NOT replayed (even with a signature present) since the model wasn't asked to think.
 func TestBuildRequestThinkingOff(t *testing.T) {
@@ -269,12 +291,12 @@ func TestBuildRequestThinkingOff(t *testing.T) {
 	}
 }
 
-func TestBuildRequestDropsMemoryCitations(t *testing.T) {
+func TestBuildRequestDropsLocalMetadata(t *testing.T) {
 	c := &client{model: "claude-opus-4-8"}
 	r := c.buildRequest(provider.Request{Messages: []provider.Message{
 		{Role: provider.RoleUser, Content: "continue"},
 		{Role: provider.RoleUser, Content: "edited prompt", Edited: true, Original: "original prompt"},
-		{Role: provider.RoleAssistant, Content: "done", MemoryCitations: []provider.MemoryCitation{{
+		{Role: provider.RoleAssistant, Content: "done", WorkDurationMs: 24_000, MemoryCitations: []provider.MemoryCitation{{
 			ID: "mem-1", Source: "MEMORY.md", LineStart: 116, LineEnd: 123, Note: "workflow",
 		}}},
 	}})
@@ -284,6 +306,9 @@ func TestBuildRequestDropsMemoryCitations(t *testing.T) {
 	}
 	if strings.Contains(string(b), "memoryCitations") || strings.Contains(string(b), "MEMORY.md") {
 		t.Fatalf("local memory citations leaked into Anthropic request: %s", b)
+	}
+	if strings.Contains(string(b), "workDurationMs") || strings.Contains(string(b), "work_duration_ms") {
+		t.Fatalf("local work duration leaked into Anthropic request: %s", b)
 	}
 	if strings.Contains(string(b), "original prompt") || strings.Contains(string(b), `"edited"`) || strings.Contains(string(b), `"original"`) {
 		t.Fatalf("local edit metadata leaked into Anthropic request: %s", b)
@@ -387,6 +412,62 @@ func TestBaseURLNormalizedForV1Messages(t *testing.T) {
 				t.Errorf("baseURL = %q, want %q", c.baseURL, tc.want)
 			}
 		})
+	}
+}
+
+func TestStreamSupportsBearerAuthHeaderAndCustomHeaders(t *testing.T) {
+	var gotAuth, gotAPIKey, gotVersion, gotUserAgent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			t.Errorf("path = %q, want /v1/messages", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		gotAPIKey = r.Header.Get("x-api-key")
+		gotVersion = r.Header.Get("anthropic-version")
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{
+		Name:    "gateway",
+		BaseURL: srv.URL,
+		Model:   "claude-sonnet-4-6",
+		APIKey:  "sk-test",
+		Extra: map[string]any{
+			"auth_header": true,
+			"headers": map[string]string{
+				"User-Agent":        "Reasonix",
+				"Authorization":     "Bearer wrong",
+				"x-api-key":         "wrong",
+				"anthropic-version": "bad",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for range ch {
+	}
+
+	if gotAuth != "Bearer sk-test" {
+		t.Fatalf("Authorization = %q, want Bearer sk-test", gotAuth)
+	}
+	if gotAPIKey != "" {
+		t.Fatalf("x-api-key = %q, want omitted", gotAPIKey)
+	}
+	if gotVersion != anthropicVersion {
+		t.Fatalf("anthropic-version = %q, want %q", gotVersion, anthropicVersion)
+	}
+	if gotUserAgent != "Reasonix" {
+		t.Fatalf("User-Agent = %q, want Reasonix", gotUserAgent)
 	}
 }
 

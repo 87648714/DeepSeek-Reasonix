@@ -3,7 +3,7 @@
 // before a tool approval prompt is shown, UserPromptSubmit before a turn, Stop
 // after it. Hooks come from settings.json — a project
 // (.reasonix/settings.json, only when the project is trusted) and a global
-// (~/.reasonix/settings.json) file. A hook's exit
+// (<Reasonix home>/settings.json) file. A hook's exit
 // code is its verdict: 0 = pass, 2 = block (only on the gating events), other =
 // warn. The payload is delivered as JSON on stdin; output is captured (capped)
 // and surfaced to the user. This package only loads, matches, and runs hooks;
@@ -27,8 +27,10 @@ import (
 	"time"
 
 	"reasonix/internal/config"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/pluginpkg"
 	"reasonix/internal/proc"
+	"reasonix/internal/secrets"
 )
 
 // Event is a point in the agent loop a hook can fire at.
@@ -201,7 +203,7 @@ func ProjectDefinesHooks(projectRoot string) bool {
 }
 
 func readSettings(path string) *Settings {
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return nil
 	}
@@ -229,6 +231,7 @@ func appendResolved(out *[]ResolvedHook, s *Settings, scope Scope, source string
 			if strings.TrimSpace(cfg.Command) == "" {
 				continue
 			}
+			cfg.Command = NormalizeCommand(cfg.Command)
 			*out = append(*out, ResolvedHook{HookConfig: cfg, Event: event, Scope: scope, Source: source})
 		}
 	}
@@ -256,6 +259,7 @@ func appendPluginHooks(out *[]ResolvedHook, reasonixHomeDir, projectRoot string)
 				if command != "" && !h.ShellCommand && !filepath.IsAbs(command) {
 					command = filepath.Join(pkg.Root, filepath.FromSlash(command))
 				}
+				command = NormalizeCommand(command)
 				contextFile := h.ContextFile
 				if contextFile != "" && !filepath.IsAbs(contextFile) {
 					contextFile = filepath.Join(pkg.Root, filepath.FromSlash(contextFile))
@@ -275,10 +279,6 @@ func appendPluginHooks(out *[]ResolvedHook, reasonixHomeDir, projectRoot string)
 				if item.Installed.Version != "" {
 					env["REASONIX_PLUGIN_VERSION"] = item.Installed.Version
 				}
-				manifestFile := pluginpkg.NativeManifest
-				if pkg.ManifestKind == "codex" {
-					manifestFile = pluginpkg.CodexManifest
-				}
 				*out = append(*out, ResolvedHook{
 					HookConfig: HookConfig{
 						Match:       h.Match,
@@ -291,7 +291,7 @@ func appendPluginHooks(out *[]ResolvedHook, reasonixHomeDir, projectRoot string)
 					},
 					Event:  event,
 					Scope:  ScopePlugin,
-					Source: filepath.Join(pkg.Root, manifestFile),
+					Source: filepath.Join(pkg.Root, pluginpkg.ManifestPath(pkg.ManifestKind)),
 				})
 			}
 		}
@@ -512,7 +512,7 @@ func runResolvedHook(ctx context.Context, h ResolvedHook, in SpawnInput, spawner
 }
 
 func readContextFile(path string) SpawnResult {
-	body, err := os.ReadFile(path)
+	body, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return SpawnResult{ExitCode: -1, SpawnErr: err}
 	}
@@ -546,12 +546,11 @@ func DefaultSpawner(ctx context.Context, in SpawnInput) SpawnResult {
 	cctx, cancel := context.WithTimeout(ctx, in.Timeout)
 	defer cancel()
 
-	name, args := shellInvocation(in.Command)
-	cmd := exec.CommandContext(cctx, name, args...)
+	cmd := spawnCommand(cctx, in.Command)
 	proc.HideWindow(cmd)
 	cmd.Dir = in.Cwd
+	env := secrets.ProcessEnv()
 	if len(in.Env) > 0 {
-		env := os.Environ()
 		keys := make([]string, 0, len(in.Env))
 		for k := range in.Env {
 			keys = append(keys, k)
@@ -560,8 +559,8 @@ func DefaultSpawner(ctx context.Context, in SpawnInput) SpawnResult {
 		for _, k := range keys {
 			env = append(env, k+"="+in.Env[k])
 		}
-		cmd.Env = env
 	}
+	cmd.Env = env
 	cmd.Stdin = strings.NewReader(in.Stdin)
 	var outBuf, errBuf cappedBuffer
 	cmd.Stdout = &outBuf
@@ -593,6 +592,35 @@ func DefaultSpawner(ctx context.Context, in SpawnInput) SpawnResult {
 		res.ExitCode = 0
 	}
 	return res
+}
+
+// spawnCommand picks the execution vehicle for a hook command. Commands run
+// through the shell by default — that is the documented contract, and scripts
+// may rely on shell expansion ($VAR, backticks). Direct exec (no shell) is
+// used only where it is strictly better:
+//   - a command this call just repaired (its broken quoting means it never
+//     worked through a shell, so there is no expansion behavior to preserve);
+//   - on Windows, a recognized node -e stdin-hook command: `cmd /c` mangles
+//     quoted JS (&, %, nested quotes), which is the breakage this repair
+//     exists for, and cmd performs no POSIX-style $ expansion to preserve.
+//
+// POSIX commands that were already well-formed keep their shell semantics
+// verbatim — normalizeStaticNodeEval's rendering escapes $ and backticks, so
+// even repaired commands re-entering here behave identically under sh -c.
+func spawnCommand(ctx context.Context, command string) *exec.Cmd {
+	if node, flag, script, ok := repairableNodeEvalArgs(command); ok {
+		return exec.CommandContext(ctx, node, flag, script)
+	}
+	if powershell, args, ok := repairablePowerShellFileArgs(command); ok {
+		return exec.CommandContext(ctx, powershell, args...)
+	}
+	if runtime.GOOS == "windows" {
+		if node, flag, script, ok := directNodeEvalArgs(command); ok {
+			return exec.CommandContext(ctx, node, flag, script)
+		}
+	}
+	name, args := shellInvocation(command)
+	return exec.CommandContext(ctx, name, args...)
 }
 
 func shellInvocation(command string) (string, []string) {
@@ -658,6 +686,9 @@ func legacyTrustPath(homeDir string) string {
 
 func legacyReasonixHome(override string) string {
 	if override != "" {
+		return ""
+	}
+	if config.IsolatedHomeDir() != "" {
 		return ""
 	}
 	home, err := os.UserHomeDir()

@@ -11,8 +11,10 @@ import (
 	"reasonix/internal/boot"
 	"reasonix/internal/config"
 	"reasonix/internal/event"
+	"reasonix/internal/sandbox"
 	"reasonix/internal/skill"
 	"reasonix/internal/tool"
+	"reasonix/internal/tool/builtin"
 )
 
 func reviewCommand(args []string) int {
@@ -77,13 +79,18 @@ func reviewCommand(args []string) int {
 	}
 
 	// 5. Build a review-scoped sub-agent registry.
-	reg := buildReviewSubagentRegistry(reviewSk)
+	reg := buildReviewSubagentRegistry(reviewSk, cfg)
 
 	// 6. Prepare the review prompt.
 	task := buildReviewTask(diff, *instructions)
 
 	// 7. Run the review subagent.
 	ctx := context.Background()
+	// Deliberately minimal Options: this one-shot CLI path has no gate, no
+	// compaction, and no session, unlike the in-session sub-agent paths built
+	// through TaskTool.subagentOptions / boot's subagentSkillOptions. If a new
+	// Options field becomes load-bearing for sub-agents, decide explicitly
+	// whether this path needs it too.
 	result, err := agent.RunSubAgentWithSession(ctx, prov, reg, agent.NewSession(reviewSk.Body), task, agent.Options{
 		MaxSteps:      12,
 		Temperature:   cfg.Agent.Temperature,
@@ -99,7 +106,7 @@ func reviewCommand(args []string) int {
 	return 0
 }
 
-func buildReviewSubagentRegistry(reviewSk skill.Skill) *tool.Registry {
+func buildReviewSubagentRegistry(reviewSk skill.Skill, cfg *config.Config) *tool.Registry {
 	// The shared helper strips subagent-unavailable background capabilities while
 	// preserving foreground bash. This direct CLI path does not go through boot,
 	// so it first builds the small parent set from the review skill allow-list.
@@ -108,6 +115,18 @@ func buildReviewSubagentRegistry(reviewSk skill.Skill) *tool.Registry {
 		if tl, ok := tool.LookupBuiltin(name); ok {
 			parentReg.Add(tl)
 		}
+	}
+	// Attach the session-data guard so commands touching Reasonix's own state
+	// warn the same way the boot-assembled bash does.
+	if _, ok := parentReg.Get("bash"); ok {
+		guard := builtin.NewSessionDataGuard(config.MemoryUserDir(), cfg.AllowWriteRoots())
+		parentReg.Add(builtin.ConfineBash(sandbox.Spec{}, guard))
+	}
+	if reviewSk.ReadOnly {
+		// The built-in review skill declares read-only; enforce it here exactly
+		// like the in-session runner does (writer tools stripped, bash under the
+		// plan-mode safe policy) so `reasonix review` is not a writable backdoor.
+		return agent.ReadOnlySubagentToolRegistry(parentReg, reviewSk.AllowedTools)
 	}
 	return agent.SubagentToolRegistry(parentReg, reviewSk.AllowedTools)
 }

@@ -20,7 +20,7 @@ import (
 func TestHistoryMessagesIncludeAssistantReasoning(t *testing.T) {
 	msgs := []provider.Message{
 		{Role: provider.RoleUser, Content: "expanded prompt"},
-		{Role: provider.RoleAssistant, Content: "answer", ReasoningContent: "thinking trace", ToolCalls: []provider.ToolCall{{
+		{Role: provider.RoleAssistant, Content: "answer", ReasoningContent: "thinking trace", WorkDurationMs: 24_000, ToolCalls: []provider.ToolCall{{
 			ID: "call_1", Name: "bash", Arguments: `{"command":"pwd"}`,
 		}}, MemoryCitations: []provider.MemoryCitation{{
 			ID: "mem-1", Source: "Memory v5", Note: "use previous bash failure", Kind: "constraint",
@@ -47,6 +47,9 @@ func TestHistoryMessagesIncludeAssistantReasoning(t *testing.T) {
 	}
 	if got[1].Reasoning != "thinking trace" {
 		t.Fatalf("assistant reasoning = %q, want thinking trace", got[1].Reasoning)
+	}
+	if got[1].WorkDurationMs != 24_000 {
+		t.Fatalf("assistant work duration = %d, want 24000", got[1].WorkDurationMs)
 	}
 	if len(got[1].MemoryCitations) != 1 || got[1].MemoryCitations[0].Note != "use previous bash failure" {
 		t.Fatalf("assistant memory citations not preserved: %+v", got[1].MemoryCitations)
@@ -86,6 +89,25 @@ func TestHistoryMessagesDoNotReplayMemoryCompilerContract(t *testing.T) {
 		t.Fatalf("raw Memory v5 contract should not be replay submitText, got %q", got[0].SubmitText)
 	}
 	assertNoHistoryMemoryContract(t, got[0].Content)
+}
+
+func TestHistoryMessagesStripActiveGoalFromVisibleUserContent(t *testing.T) {
+	raw := "<active-goal>\nship the approval redesign\n</active-goal>\n\ncontinue implementation"
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: raw},
+		{Role: provider.RoleAssistant, Content: "done"},
+	}
+
+	got := historyMessages(msgs, control.StripComposePrefixes)
+	if len(got) != 2 {
+		t.Fatalf("history length = %d, want 2: %+v", len(got), got)
+	}
+	if got[0].Content != "continue implementation" {
+		t.Fatalf("visible user content = %q, want active-goal stripped", got[0].Content)
+	}
+	if strings.Contains(got[0].Content, "<active-goal>") || strings.Contains(got[0].Content, "ship the approval redesign") {
+		t.Fatalf("active-goal leaked into visible history content: %+v", got[0])
+	}
 }
 
 func TestHistoryMessagesCarryCheckpointTurnsAcrossHiddenSyntheticUsers(t *testing.T) {

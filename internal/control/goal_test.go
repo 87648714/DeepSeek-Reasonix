@@ -12,6 +12,7 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
 	"reasonix/internal/provider"
+	"reasonix/internal/store"
 	"reasonix/internal/tool"
 )
 
@@ -50,6 +51,26 @@ func TestGoalCommandAutoContinuesUntilComplete(t *testing.T) {
 	}
 	if strings.HasPrefix(first, PlanModeMarker) {
 		t.Fatalf("goal mode should not enter plan mode, got %q", first)
+	}
+}
+
+func TestActiveGoalBlockCarriesTaskContractAndPausePolicy(t *testing.T) {
+	block := activeGoalBlock("fix the parser", GoalResearchOff)
+	for _, want := range []string{
+		"Treat the user's goal as a task contract",
+		"Context, Request, Output format, Constraints",
+		"Pause policy",
+		"irreversible or externally visible operation",
+		"the requested scope has changed",
+		"information only the user can provide",
+		"output format and constraints are satisfied",
+	} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("active goal block missing %q:\n%s", want, block)
+		}
+	}
+	if strings.Contains(block, "AutoResearch protocol") {
+		t.Fatalf("simple goal should not include AutoResearch protocol:\n%s", block)
 	}
 }
 
@@ -474,8 +495,8 @@ func TestResearchGoalCompletionIsInterceptedWhenReadinessFails(t *testing.T) {
 	if !sessionContainsUserText(ag.Session().Messages, "AutoResearch readiness check failed", "objective_evidence", "verification") {
 		t.Fatalf("transcript missing readiness intercept; last user:\n%s", lastUserMessage(ag.Session().Messages))
 	}
-	if !containsNotice(notices, "autoresearch readiness blocked completion") {
-		t.Fatalf("notices = %+v, want autoresearch readiness blocked completion", notices)
+	if !containsNotice(notices, "Goal is not ready to complete yet; continuing the remaining work.") {
+		t.Fatalf("notices = %+v, want readiness continuation notice", notices)
 	}
 }
 
@@ -644,8 +665,8 @@ func TestResearchGoalBlockedMarksAutoResearchTaskBlocked(t *testing.T) {
 	if summary.Status != "blocked" || !strings.Contains(summary.Blocker, "needs credentials") {
 		t.Fatalf("AutoResearch summary = %+v, want blocked with reason", summary)
 	}
-	if !containsNotice(notices, "autoresearch task blocked") {
-		t.Fatalf("notices = %+v, want autoresearch task blocked", notices)
+	if !containsNotice(notices, "AutoResearch task marked blocked.") {
+		t.Fatalf("notices = %+v, want autoresearch blocked notice", notices)
 	}
 }
 
@@ -865,13 +886,13 @@ func TestGoalInterceptsCompleteWithIncompleteTodos(t *testing.T) {
 	// (second [goal:complete] overrides the intercept).
 	found := false
 	for _, n := range allNotices {
-		if strings.Contains(n, "goal intercept") {
+		if strings.Contains(n, "Goal still has unfinished task state") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Fatalf("expected a 'goal intercept' notice, got %v", allNotices)
+		t.Fatalf("expected an unfinished-goal notice, got %v", allNotices)
 	}
 	if c.GoalStatus() != GoalStatusComplete {
 		t.Fatalf("GoalStatus() = %q, want complete (second [goal:complete] should override)", c.GoalStatus())
@@ -1079,4 +1100,62 @@ func containsNotice(notices []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestSessionRotationClearsActiveGoal pins the /new & /clear goal semantics:
+// a fresh session starts with no active goal (so the old goal's text stops
+// injecting into its first turns), while the OLD session's persisted
+// goal-state sidecar keeps the running goal so resuming it restores the goal.
+func TestSessionRotationClearsActiveGoal(t *testing.T) {
+	dir := t.TempDir()
+	exec := agent.New(nil, nil, agent.NewSession("sys"), agent.Options{}, event.Discard)
+	oldPath := filepath.Join(dir, "session.jsonl")
+	c := New(Options{Executor: exec, SystemPrompt: "sys", SessionDir: dir, SessionPath: oldPath, Label: "test"})
+
+	c.SetGoal("ship the release checklist")
+	if got := c.Goal(); got != "ship the release checklist" {
+		t.Fatalf("Goal() = %q after SetGoal", got)
+	}
+	if composed := c.Compose("hello"); !strings.Contains(composed, "<active-goal>") {
+		t.Fatalf("running goal should inject into turns, composed = %q", composed)
+	}
+
+	if err := c.NewSession(); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if got := c.Goal(); got != "" {
+		t.Fatalf("Goal() after /new = %q, want empty", got)
+	}
+	if composed := c.Compose("hello"); strings.Contains(composed, "<active-goal>") {
+		t.Fatalf("old goal leaked into the fresh session's turn: %q", composed)
+	}
+	// The old session keeps its running goal on disk for /resume.
+	oldState, err := os.ReadFile(store.SessionGoalState(oldPath))
+	if err != nil {
+		t.Fatalf("read old goal state: %v", err)
+	}
+	if !strings.Contains(string(oldState), "ship the release checklist") || !strings.Contains(string(oldState), GoalStatusRunning) {
+		t.Fatalf("old session's goal state was disturbed by /new: %s", oldState)
+	}
+	// The new session's sidecar records the cleared (stopped) state, so
+	// profile restores read it as "no running goal".
+	newState, err := os.ReadFile(store.SessionGoalState(c.SessionPath()))
+	if err != nil {
+		t.Fatalf("read new goal state: %v", err)
+	}
+	if strings.Contains(string(newState), "ship the release checklist") {
+		t.Fatalf("new session's goal state carries the old goal: %s", newState)
+	}
+
+	// Same contract for /clear.
+	c.SetGoal("another goal")
+	if err := c.ClearSession(); err != nil {
+		t.Fatalf("ClearSession: %v", err)
+	}
+	if got := c.Goal(); got != "" {
+		t.Fatalf("Goal() after /clear = %q, want empty", got)
+	}
+	if composed := c.Compose("hello"); strings.Contains(composed, "<active-goal>") {
+		t.Fatalf("old goal leaked into the cleared session's turn: %q", composed)
+	}
 }

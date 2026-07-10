@@ -13,8 +13,10 @@ import (
 
 	"reasonix/internal/config"
 	"reasonix/internal/control"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/hook"
 	"reasonix/internal/provider"
+	"reasonix/internal/sandbox"
 )
 
 type captureTurnRunner struct {
@@ -127,6 +129,64 @@ func TestProviderViewFromEntryShowsKeySource(t *testing.T) {
 	}
 	if view.KeySource == "" || !strings.Contains(view.KeySource, "credentials") {
 		t.Fatalf("KeySource = %q, want credentials source", view.KeySource)
+	}
+}
+
+func TestSettingsExposesEffectiveSandboxWriteRoots(t *testing.T) {
+	home := isolateDesktopUserDirs(t)
+	project := robustTempDir(t)
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	cfg.Sandbox.AllowWrite = []string{
+		"${HOME}/.m2",
+		"${HOME}/.m2/repository",
+	}
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	app := NewApp()
+	app.tabs = map[string]*WorkspaceTab{
+		"project": {ID: "project", Scope: "project", WorkspaceRoot: project, Ready: true},
+	}
+	app.activeTabID = "project"
+
+	got := app.Settings().Sandbox
+	if got.EffectiveWorkspaceRoot != project {
+		t.Fatalf("EffectiveWorkspaceRoot = %q, want %q", got.EffectiveWorkspaceRoot, project)
+	}
+	// Settings expose expanded configured roots; the writer confiner normalizes
+	// separators later when enforcing them.
+	want := []string{
+		project,
+		home + "/.m2",
+		home + "/.m2/repository",
+	}
+	if !reflect.DeepEqual(got.EffectiveWriteRoots, want) {
+		t.Fatalf("EffectiveWriteRoots = %v, want %v", got.EffectiveWriteRoots, want)
+	}
+	if !reflect.DeepEqual(got.AllowWrite, cfg.Sandbox.AllowWrite) {
+		t.Fatalf("AllowWrite = %v, want raw configured paths %v", got.AllowWrite, cfg.Sandbox.AllowWrite)
+	}
+	if got.EffectiveShell == "" {
+		t.Fatal("EffectiveShell is empty")
+	}
+}
+
+func TestSandboxEffectiveShellViewLabels(t *testing.T) {
+	cases := []struct {
+		name  string
+		shell sandbox.Shell
+		want  string
+	}{
+		{"bash", sandbox.Shell{Kind: sandbox.ShellBash, Path: "bash"}, "bash"},
+		{"git bash", sandbox.Shell{Kind: sandbox.ShellBash, Path: `C:\Program Files\Git\bin\bash.exe`}, "git-bash"},
+		{"windows powershell", sandbox.Shell{Kind: sandbox.ShellPowerShell, Path: "powershell"}, "powershell"},
+		{"pwsh", sandbox.Shell{Kind: sandbox.ShellPowerShell, Path: "pwsh"}, "pwsh"},
+	}
+	for _, tc := range cases {
+		if got := sandboxEffectiveShellView(tc.shell); got != tc.want {
+			t.Errorf("%s: sandboxEffectiveShellView() = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
 
@@ -414,6 +474,35 @@ func TestSaveProviderPersistsThinkingOverride(t *testing.T) {
 	}
 	if got.Thinking != "disabled" {
 		t.Fatalf("saved provider thinking = %q, want disabled", got.Thinking)
+	}
+}
+
+func TestSaveProviderPersistsAuthHeader(t *testing.T) {
+	isolateDesktopUserDirs(t)
+
+	app := NewApp()
+	if err := app.SaveProvider(ProviderView{
+		Name:       "minimax-global-anthropic",
+		Kind:       "anthropic",
+		BaseURL:    "https://api.minimax.io/anthropic",
+		Models:     []string{"MiniMax-M3"},
+		APIKeyEnv:  "MINIMAX_API_KEY",
+		AuthHeader: true,
+	}); err != nil {
+		t.Fatalf("SaveProvider: %v", err)
+	}
+
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	got, ok := cfg.Provider("minimax-global-anthropic")
+	if !ok {
+		t.Fatal("saved provider not found")
+	}
+	if !got.AuthHeader {
+		t.Fatal("saved provider auth_header = false, want true")
+	}
+	view := providerViewFromEntry(*got, false, true)
+	if !view.AuthHeader {
+		t.Fatal("provider view authHeader = false, want true")
 	}
 }
 
@@ -763,7 +852,7 @@ func TestSetReasoningLanguageUpdatesLiveTabControllers(t *testing.T) {
 	}
 
 	userComposed := userCtrl.Compose("hi")
-	if !strings.Contains(userComposed, "Simplified Chinese") {
+	if !strings.Contains(userComposed, "简体中文") {
 		t.Fatalf("user-level tab Compose = %q, want zh reasoning language", userComposed)
 	}
 	projectComposed := projectCtrl.Compose("hi")
@@ -1071,6 +1160,70 @@ func TestSaveHooksSettingsPreservesUnknownSettingsKeys(t *testing.T) {
 	}
 }
 
+func TestSaveHooksSettingsDecodesLegacyEncodedGlobalSettings(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	path := hook.GlobalSettingsPath("")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := `{"label":"中文","hooks":{"Stop":[{"command":"echo 旧"}]}}`
+	if err := os.WriteFile(path, fileencoding.Encode(legacy, fileencoding.GB18030), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	before := app.HooksSettings("global")
+	if len(before.Hooks) != 1 || before.Hooks[0].Command != "echo 旧" {
+		t.Fatalf("HooksSettings before save = %+v, want decoded legacy hook", before.Hooks)
+	}
+	if err := app.SaveHooksSettings("global", []HookConfigView{{
+		Event:   string(hook.PreToolUse),
+		Command: "echo 新",
+	}}); err != nil {
+		t.Fatalf("SaveHooksSettings: %v", err)
+	}
+
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("saved settings should be valid UTF-8 JSON: %v", err)
+	}
+	if string(raw["label"]) != `"中文"` {
+		t.Fatalf("label key was not preserved after decoding legacy settings: %s", raw["label"])
+	}
+	view := app.HooksSettings("global")
+	if len(view.Hooks) != 1 || view.Hooks[0].Command != "echo 新" {
+		t.Fatalf("HooksSettings after save = %+v, want new decoded hook", view.Hooks)
+	}
+}
+
+func TestSaveHooksSettingsNormalizesQuotedNodeEvalHookCommand(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	script := "const payload = JSON.parse(require('fs').readFileSync(0, 'utf8')); console.log(payload.toolName)"
+	bad := `node -e "\"` + script + `\""`
+	want := hook.NormalizeCommand(bad)
+	if want == bad {
+		t.Fatal("test command did not normalize")
+	}
+
+	app := NewApp()
+	if err := app.SaveHooksSettings("global", []HookConfigView{{
+		Event:   string(hook.PreToolUse),
+		Match:   "bash",
+		Command: bad,
+	}}); err != nil {
+		t.Fatalf("SaveHooksSettings: %v", err)
+	}
+
+	view := app.HooksSettings("global")
+	if len(view.Hooks) != 1 || view.Hooks[0].Command != want {
+		t.Fatalf("HooksSettings = %+v, want normalized command %q", view.Hooks, want)
+	}
+}
+
 func TestProjectHooksSettingsUseActiveWorkspaceRootAndTrust(t *testing.T) {
 	home := isolateDesktopUserDirs(t)
 	project := t.TempDir()
@@ -1149,5 +1302,158 @@ func TestSaveHooksSettingsForRootUsesDisplayedProjectRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(projectB, ".reasonix", "settings.json")); err == nil {
 		t.Fatal("active project root was written instead of displayed project root")
+	}
+}
+
+// TestLoadDesktopUserConfigForViewDoesNotPersistLegacyProviderAccess locks the
+// read-path contract: loading a legacy-form config (configured providers but
+// no declared desktop.provider_access) through the View helpers returns a
+// normalized in-memory view while leaving the file bytes untouched. The
+// on-disk migration only happens once a locked write path runs.
+func TestLoadDesktopUserConfigForViewDoesNotPersistLegacyProviderAccess(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	userPath := config.UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "default_model = \"local/m1\"\n\n[[providers]]\nname = \"local\"\nbase_url = \"http://127.0.0.1:9999/v1\"\nmodels = [\"m1\"]\n"
+	if err := os.WriteFile(userPath, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	for name, load := range map[string]func() (*config.Config, string, error){
+		"view":                  app.loadDesktopUserConfigForView,
+		"view-with-credentials": app.loadDesktopUserConfigForViewWithCredentials,
+	} {
+		cfg, _, err := load()
+		if err != nil {
+			t.Fatalf("%s load: %v", name, err)
+		}
+		if len(cfg.Desktop.ProviderAccess) == 0 {
+			t.Fatalf("%s load should normalize legacy provider access in memory", name)
+		}
+		raw, err := os.ReadFile(userPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != legacy {
+			t.Fatalf("%s load must not rewrite the user config, got:\n%s", name, raw)
+		}
+	}
+
+	// The first locked write path persists the pending migration.
+	if err := app.applyConfigOnly(func(*config.Config) error { return nil }); err != nil {
+		t.Fatalf("applyConfigOnly: %v", err)
+	}
+	if !configDeclaresProviderAccess(userPath) {
+		t.Fatal("locked write path should persist the provider access migration to disk")
+	}
+	migrated := config.LoadForEditWithoutCredentials(userPath)
+	if len(migrated.Desktop.ProviderAccess) == 0 {
+		t.Fatalf("migrated config lost provider access: %v", migrated.Desktop.ProviderAccess)
+	}
+}
+
+// TestLoadDesktopUserConfigViewKeepsLegacyBotConfigMigrationInMemory locks the
+// same contract for the legacy bot-config migration: read paths (including the
+// bot runtime's credential-loading view) see the merged bot config in memory
+// without any file being written; the locked write path performs the on-disk
+// migration.
+func TestLoadDesktopUserConfigViewKeepsLegacyBotConfigMigrationInMemory(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	userPath := config.UserConfigPath()
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	userBody := "default_model = \"local/m1\"\n"
+	if err := os.WriteFile(userPath, []byte(userBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacyRoot := t.TempDir()
+	legacyPath := filepath.Join(legacyRoot, "reasonix.toml")
+	legacyBody := "[bot]\nenabled = true\nmodel = \"local/m1\"\n"
+	if err := os.WriteFile(legacyPath, []byte(legacyBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	app.tabs = map[string]*WorkspaceTab{
+		"t": {ID: "t", Scope: "project", WorkspaceRoot: legacyRoot, Ready: true},
+	}
+	app.activeTabID = "t"
+
+	assertFilesUntouched := func(step string) {
+		t.Helper()
+		rawUser, err := os.ReadFile(userPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(rawUser) != userBody {
+			t.Fatalf("%s must not rewrite the user config, got:\n%s", step, rawUser)
+		}
+		rawLegacy, err := os.ReadFile(legacyPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(rawLegacy) != legacyBody {
+			t.Fatalf("%s must not rewrite the legacy config, got:\n%s", step, rawLegacy)
+		}
+	}
+
+	cfg, _, err := app.loadDesktopUserConfigForView()
+	if err != nil {
+		t.Fatalf("loadDesktopUserConfigForView: %v", err)
+	}
+	if !cfg.Bot.Enabled {
+		t.Fatal("view load should merge the legacy bot config in memory")
+	}
+	assertFilesUntouched("loadDesktopUserConfigForView")
+
+	botCfg, err := app.loadDesktopBotConfig()
+	if err != nil {
+		t.Fatalf("loadDesktopBotConfig: %v", err)
+	}
+	if !botCfg.Bot.Enabled {
+		t.Fatal("bot runtime load should see the merged legacy bot config")
+	}
+	assertFilesUntouched("loadDesktopBotConfig")
+
+	// The first locked write path migrates the bot config into the user file.
+	if err := app.applyConfigOnly(func(*config.Config) error { return nil }); err != nil {
+		t.Fatalf("applyConfigOnly: %v", err)
+	}
+	migrated := config.LoadForEditWithoutCredentials(userPath)
+	if !migrated.Bot.Enabled {
+		t.Fatal("locked write path should persist the legacy bot config migration")
+	}
+	rawLegacy, err := os.ReadFile(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(rawLegacy) != legacyBody {
+		t.Fatalf("migration must not rewrite the legacy config, got:\n%s", rawLegacy)
+	}
+}
+
+func TestSetBotSettingsPreservesFeishuOutboundMediaRoots(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	root := t.TempDir()
+	cfg := config.Default()
+	cfg.Bot.Feishu.OutboundMediaRoots = []string{root}
+	if err := cfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+
+	app := NewApp()
+	view := botSettingsView(cfg.Bot)
+	view.QueueCap++
+	if err := app.SetBotSettings(view); err != nil {
+		t.Fatalf("SetBotSettings: %v", err)
+	}
+
+	got := config.LoadForEditWithoutCredentials(config.UserConfigPath())
+	if !reflect.DeepEqual(got.Bot.Feishu.OutboundMediaRoots, []string{root}) {
+		t.Fatalf("outbound media roots = %v, want preserved %q", got.Bot.Feishu.OutboundMediaRoots, root)
 	}
 }

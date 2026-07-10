@@ -8,7 +8,7 @@ import { Composer, composerPickFileEntry } from "../components/Composer";
 import { LocaleProvider } from "../lib/i18n";
 import { ToastProvider } from "../lib/toast";
 import type { AppBindings } from "../lib/bridge";
-import type { CollaborationMode, ToolApprovalMode, TokenMode } from "../lib/types";
+import type { CollaborationMode, DirEntry, ToolApprovalMode, TokenMode } from "../lib/types";
 
 let passed = 0;
 let failed = 0;
@@ -105,6 +105,7 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
     tokenMode: "full" as TokenMode,
     goal: "",
     cwd: "/repo",
+    tabId: "tab-a",
     modelLabel: "DeepSeek-R1",
     onSend: (displayText, submitText) => {
       calls.send.push(displayText);
@@ -200,6 +201,16 @@ async function waitFor(label: string, predicate: () => boolean) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
+type RenderedComposer = Awaited<ReturnType<typeof renderComposer>>;
+
+function fileEntry(name: string): DirEntry {
+  return { name, isDir: false };
+}
+
+async function replaceComposerDraft(rerender: RenderedComposer["rerender"], id: number, text: string) {
+  await rerender({ insertRequest: { id, text, mode: "replace" } });
+}
+
 console.log("\ncomposer goal toggle");
 
 {
@@ -247,7 +258,7 @@ console.log("\ncomposer goal toggle");
     turnStartAt: Date.now(),
   });
 
-  const stopButton = document.querySelector(".composer-runstatus__stop") as HTMLButtonElement | null;
+  const stopButton = document.querySelector(".composer__btn--stop") as HTMLButtonElement | null;
   if (!stopButton) throw new Error("composer stop button did not render");
 
   await act(async () => {
@@ -633,7 +644,7 @@ console.log("\ncomposer goal toggle");
   const sendButton = document.querySelector(".composer__btn--send") as HTMLButtonElement | null;
   if (!sendButton) throw new Error("running composer send button did not render");
 
-  eq(textarea.placeholder, "Add guidance to the queue...", "running composer explains queued guidance input");
+  eq(textarea.placeholder, "Running — type guidance, Enter adds it to the queue", "running composer explains queued guidance input");
   ok(sendButton.classList.contains("composer__btn--steer"), "running composer marks send button as steer");
   ok(sendButton.disabled === true, "running steer button stays disabled without input");
 
@@ -732,6 +743,285 @@ console.log("\ncomposer goal toggle");
   });
 
   eq(calls.send.join(","), "steer while activating", "queued guidance can be guided while controllerReady is false");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  // Reproduces #6210: a message queued while a turn is running, without the
+  // explicit "guide" steer click, must not vanish when the turn ends on its
+  // own — it is the user's next turn, so it should send automatically.
+  const dom = installDom();
+  const { root, calls, rerender } = await renderComposer({
+    running: true,
+    onSend: (displayText, submitText) => {
+      calls.send.push(displayText);
+      calls.submit.push(submitText);
+      return Promise.resolve();
+    },
+  });
+
+  await rerender({ insertRequest: { id: 8, text: "keep going after this finishes", mode: "replace" } });
+  const sendButton = document.querySelector(".composer__btn--send") as HTMLButtonElement | null;
+  if (!sendButton) throw new Error("running composer send button did not render");
+
+  await act(async () => {
+    sendButton.click();
+    await flushTimers();
+  });
+
+  eq(calls.send.length, 0, "queuing while running does not send immediately");
+  ok(document.querySelector(".composer-guidance-item") !== null, "queued message shows in the guidance shelf");
+
+  await rerender({ running: false });
+  await waitFor("queued guidance auto-sent on natural completion", () => calls.send.length === 1);
+
+  eq(calls.send.join(","), "keep going after this finishes", "queued guidance is sent automatically once the turn ends naturally, not discarded");
+  eq(calls.submit.join(","), "keep going after this finishes", "auto-sent guidance submits the same text it was queued with");
+  ok(document.querySelector(".composer-guidance-item") === null, "guidance shelf clears once the queued message is sent");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  // #6210 follow-up: if the turn ends naturally while the controller is
+  // still activating/hydrating (submitDisabled), onSend would silently
+  // no-op — auto-send must wait for submitDisabled to clear instead of
+  // firing into that window and losing the queued message anyway.
+  const dom = installDom();
+  const { root, calls, rerender } = await renderComposer({
+    running: true,
+    submitDisabled: false,
+    onSend: (displayText, submitText) => {
+      calls.send.push(displayText);
+      calls.submit.push(submitText);
+      return Promise.resolve();
+    },
+  });
+
+  await rerender({ insertRequest: { id: 9, text: "keep going once ready", mode: "replace" } });
+  const sendButton = document.querySelector(".composer__btn--send") as HTMLButtonElement | null;
+  if (!sendButton) throw new Error("running composer send button did not render");
+
+  await act(async () => {
+    sendButton.click();
+    await flushTimers();
+  });
+  ok(document.querySelector(".composer-guidance-item") !== null, "queued message shows in the guidance shelf");
+
+  // Turn ends, but the controller is still not ready to accept a submit —
+  // matches a rebuild/hydration window right after the turn finishes.
+  await rerender({ running: false, submitDisabled: true });
+  await act(async () => {
+    await flushTimers();
+  });
+  eq(calls.send.length, 0, "auto-send does not fire while the controller is still activating");
+  ok(document.querySelector(".composer-guidance-item") !== null, "queued message stays on the shelf while not ready");
+
+  await rerender({ submitDisabled: false });
+  await waitFor("queued guidance auto-sent once the controller becomes ready", () => calls.send.length === 1);
+
+  eq(calls.send.join(","), "keep going once ready", "queued guidance sends once submitDisabled clears, instead of being lost");
+  ok(document.querySelector(".composer-guidance-item") === null, "guidance shelf clears once the delayed send completes");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  let listDirCalls = 0;
+  const listDirTabs: string[] = [];
+  mockApp({
+    ListDirForTab: async (tabId) => {
+      listDirTabs.push(tabId);
+      listDirCalls += 1;
+      return listDirCalls === 1 ? [fileEntry("cached-dir.txt")] : [fileEntry("fresh-dir.txt")];
+    },
+    SearchFileRefsForTab: async () => [],
+  });
+  const { root, rerender } = await renderComposer();
+
+  await replaceComposerDraft(rerender, 101, "@");
+  await waitFor("initial @ directory load", () => listDirCalls === 1);
+
+  await replaceComposerDraft(rerender, 102, "");
+  await replaceComposerDraft(rerender, 103, "@");
+  await waitFor("@ directory revalidation call", () => listDirCalls === 2);
+
+  eq(listDirCalls, 2, "@ directory cache hit still revalidates ListDir");
+  ok(listDirTabs.every((tabId) => tabId === "tab-a"), "@ directory requests stay scoped to the composer tab");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  let listDirCalls = 0;
+  mockApp({
+    ListDirForTab: async () => {
+      listDirCalls += 1;
+      return listDirCalls === 1 ? [fileEntry("manual-refresh-stale.txt")] : [fileEntry("manual-refresh-fresh.txt")];
+    },
+    SearchFileRefsForTab: async () => [],
+  });
+  const { root, rerender } = await renderComposer({ fileRefRefreshKey: "0" });
+
+  await replaceComposerDraft(rerender, 201, "@");
+  await waitFor("initial @ directory load before refresh key", () => listDirCalls === 1);
+
+  await rerender({ fileRefRefreshKey: "1" });
+  await waitFor("@ directory reload after refresh key", () => listDirCalls === 2);
+
+  eq(listDirCalls, 2, "fileRefRefreshKey refreshes @ directory cache while the menu is open");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const realDateNow = Date.now;
+  let now = 1000;
+  let searchCalls = 0;
+  Date.now = () => now;
+  mockApp({
+    ListDirForTab: async () => [],
+    SearchFileRefsForTab: async () => {
+      searchCalls += 1;
+      return searchCalls === 1 ? [fileEntry("alpha-old.ts")] : [fileEntry("alpha-new.ts")];
+    },
+  });
+  const { root, rerender } = await renderComposer();
+
+  try {
+    await replaceComposerDraft(rerender, 301, "@alpha");
+    await waitFor("initial @ search request", () => searchCalls === 1);
+    eq(searchCalls, 1, "@ search fetches the first query");
+
+    await replaceComposerDraft(rerender, 302, "");
+    now = 2000;
+    await replaceComposerDraft(rerender, 303, "@alpha");
+    await act(async () => {
+      await flushTimers();
+    });
+    eq(searchCalls, 1, "@ search cache is reused inside the TTL");
+
+    await replaceComposerDraft(rerender, 304, "");
+    now = 7001;
+    await replaceComposerDraft(rerender, 305, "@alpha");
+    await waitFor("expired @ search cache refresh", () => searchCalls === 2);
+    eq(searchCalls, 2, "@ search cache revalidates after the TTL");
+  } finally {
+    Date.now = realDateNow;
+  }
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  let staleListDirResolve: ((entries: DirEntry[]) => void) | undefined;
+  let thirdListDirResolve: ((entries: DirEntry[]) => void) | undefined;
+  let listDirCalls = 0;
+  mockApp({
+    ListDirForTab: async () => {
+      listDirCalls += 1;
+      if (listDirCalls === 1) {
+        return new Promise<DirEntry[]>((resolve) => {
+          staleListDirResolve = resolve;
+        });
+      }
+      if (listDirCalls === 2) return [fileEntry("cache-live.txt")];
+      return new Promise<DirEntry[]>((resolve) => {
+        thirdListDirResolve = resolve;
+      });
+    },
+    SearchFileRefsForTab: async () => [],
+  });
+  const { root, rerender } = await renderComposer({ fileRefRefreshKey: "0" });
+
+  const textarea = document.querySelector("textarea") as HTMLTextAreaElement | null;
+  if (!textarea) throw new Error("composer textarea did not render");
+
+  await replaceComposerDraft(rerender, 401, "@cache");
+  await waitFor("initial stale @ directory request", () => listDirCalls === 1);
+
+  await rerender({ fileRefRefreshKey: "1" });
+  await waitFor("fresh @ directory request after refresh key", () => listDirCalls === 2);
+  await act(async () => {
+    await flushTimers();
+  });
+
+  staleListDirResolve?.([fileEntry("cache-stale.txt")]);
+  await act(async () => {
+    await flushTimers();
+  });
+
+  await replaceComposerDraft(rerender, 402, "");
+  await replaceComposerDraft(rerender, 403, "@cache");
+  await waitFor("second fresh @ directory request", () => listDirCalls === 3);
+  await act(async () => {
+    textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await flushTimers();
+  });
+  eq(textarea.value, "@cache-live.txt ", "stale @ directory request cannot repopulate cache after refresh");
+  thirdListDirResolve?.([fileEntry("cache-later.txt")]);
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const pending: Array<(entries: DirEntry[]) => void> = [];
+  mockApp({
+    ListDirForTab: async () => [],
+    SearchFileRefsForTab: async () => new Promise<DirEntry[]>((resolve) => pending.push(resolve)),
+  });
+  const { root, rerender } = await renderComposer({ workspaceScopeKey: "session-a" });
+  const textarea = document.querySelector("textarea") as HTMLTextAreaElement | null;
+  if (!textarea) throw new Error("composer textarea did not render");
+
+  await replaceComposerDraft(rerender, 501, "@current");
+  await waitFor("initial composer session scope request", () => pending.length === 1);
+  await rerender({ workspaceScopeKey: "session-b" });
+  await waitFor("next composer session scope request", () => pending.length === 2);
+  await rerender({ workspaceScopeKey: "session-a" });
+  await waitFor("revisited composer session scope request", () => pending.length === 3);
+
+  await act(async () => {
+    pending[2]([fileEntry("current-session-a.txt")]);
+    await flushTimers();
+  });
+
+  await act(async () => {
+    pending[0]([fileEntry("stale-initial-a.txt")]);
+    pending[1]([fileEntry("stale-session-b.txt")]);
+    await flushTimers();
+    textarea.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await flushTimers();
+  });
+
+  eq(textarea.value, "@current-session-a.txt ", "same-tab A→B→A keeps the current composer file-ref search cache");
 
   await act(async () => {
     root.unmount();

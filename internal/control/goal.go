@@ -11,14 +11,15 @@ import (
 	"unicode"
 
 	"reasonix/internal/evidence"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/store"
 )
 
 const (
 	maxGoalAutoTurns   = 50
 	maxGoalIdleTurns   = 2
-	goalContinueTurn   = "Continue pursuing the active goal. If it is complete, provide the concise final result and end with [goal:complete]. If it is truly blocked on a user-owned decision after trying sensible defaults, end with [goal:blocked:<short reason>]. Otherwise do the next useful work and end with [goal:continue]."
-	goalSelfCheckTurn  = "The agent signaled goal completion and all tasks are marked done. Before finalizing, perform a brief quality self-check:\n1. Verify any changed files compile or parse correctly\n2. Run the relevant tests if applicable\n3. Confirm the original requirements are met\nIf everything checks out, signal [goal:complete]. If issues are found, fix them and signal [goal:complete] when done."
+	goalContinueTurn   = "Continue pursuing the active goal under its task contract. If it is complete, provide the concise final result and end with [goal:complete]. If progress genuinely requires user-only information, an irreversible or externally visible operation, or a changed scope, end with [goal:blocked:<short reason>]. Otherwise use sensible defaults, do the next useful work, and end with [goal:continue]."
+	goalSelfCheckTurn  = "The agent signaled goal completion and all tasks are marked done. Before finalizing, perform a brief quality self-check:\n1. Verify any changed files compile or parse correctly\n2. Run the relevant tests if applicable\n3. Confirm the original request, output format, constraints, and success criteria are met\nIf everything checks out, signal [goal:complete]. If issues are found, fix them and signal [goal:complete] when done."
 	goalCompleteNotice = "goal complete"
 )
 
@@ -347,7 +348,7 @@ func (g *goalMachine) terminalTodosFromState(sessionPath string) ([]evidence.Tod
 	if strings.TrimSpace(sessionPath) == "" {
 		return nil, false
 	}
-	data, err := os.ReadFile(goalStatePath(sessionPath))
+	data, err := fileencoding.ReadFileUTF8(goalStatePath(sessionPath))
 	if err != nil {
 		if !os.IsNotExist(err) {
 			slog.Warn("controller: read goal state", "err", err)
@@ -378,7 +379,7 @@ func (g *goalMachine) restoreRunningFromState(sessionPath string) {
 	if strings.TrimSpace(sessionPath) == "" {
 		return
 	}
-	data, err := os.ReadFile(goalStatePath(sessionPath))
+	data, err := fileencoding.ReadFileUTF8(goalStatePath(sessionPath))
 	if err != nil {
 		if !os.IsNotExist(err) {
 			slog.Warn("controller: read goal state", "err", err)

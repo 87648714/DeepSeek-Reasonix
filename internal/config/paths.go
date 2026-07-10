@@ -1,10 +1,13 @@
 package config
 
 import (
+	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -102,6 +105,9 @@ func userConfigCandidatePaths() []string {
 }
 
 func legacyXDGConfigPaths() []string {
+	if IsolatedHomeDir() != "" {
+		return nil
+	}
 	if runtimeGOOS == "windows" {
 		return nil
 	}
@@ -135,6 +141,9 @@ func userSupportDir() string {
 }
 
 func legacyOSSupportDir() string {
+	if IsolatedHomeDir() != "" {
+		return ""
+	}
 	dir := osUserConfigDir()
 	if dir == "" {
 		return ""
@@ -149,6 +158,9 @@ func legacyOSSupportDir() string {
 func userCacheDir() string {
 	if dir := cleanEnvDir("REASONIX_CACHE_HOME"); dir != "" {
 		return dir
+	}
+	if dir := cleanEnvDir("REASONIX_HOME"); dir != "" {
+		return filepath.Join(dir, "cache")
 	}
 	dir, err := os.UserCacheDir()
 	if err != nil {
@@ -193,6 +205,14 @@ func samePath(a, b string) bool {
 		b = bb
 	}
 	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// IsolatedHomeDir returns the REASONIX_HOME directory when it has been
+// explicitly set via the environment variable. A non-empty return signals a
+// self-contained runtime that must not fall back to legacy OS-default data
+// paths or import data from the system-wide production install.
+func IsolatedHomeDir() string {
+	return cleanEnvDir("REASONIX_HOME")
 }
 
 // userConfigDisplayPath is userConfigPath collapsed to a ~-relative form for
@@ -246,6 +266,37 @@ func LegacyUserConfigPaths() []string {
 	return out
 }
 
+// ReasonixManagedConfigPaths returns the Reasonix-owned user configuration
+// FILES that model-driven tools may repair on the user's request, each gated
+// by a fresh per-write human approval: the current config.toml, compatibility
+// TOML locations, and the legacy v0.x ~/.reasonix/config.json. Individual
+// files, never directories — the Reasonix home also holds credentials (.env),
+// global hooks (settings.json), skills, and session stores, and none of those
+// may ride along on a config repair.
+func ReasonixManagedConfigPaths() []string {
+	var out []string
+	out = appendUniquePath(out, UserConfigPath())
+	for _, path := range LegacyUserConfigPaths() {
+		out = appendUniquePath(out, path)
+	}
+	out = appendUniquePath(out, legacyConfigPath())
+	return out
+}
+
+func appendUniquePath(paths []string, path string) []string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return paths
+	}
+	clean := filepath.Clean(path)
+	for _, existing := range paths {
+		if samePath(existing, clean) {
+			return paths
+		}
+	}
+	return append(paths, clean)
+}
+
 // ReasonixHomeDir is the current Reasonix home directory. It honors
 // REASONIX_HOME, then uses ~/.reasonix on macOS/Linux or %APPDATA%/reasonix on
 // Windows, with a %USERPROFILE%/AppData/Roaming fallback when %APPDATA% is
@@ -258,7 +309,7 @@ func ReasonixHomeDir() string { return reasonixHomeDir() }
 // the user saved through setup or settings. "" when Reasonix home can't be
 // resolved.
 func UserCredentialsPath() string {
-	dir := userSupportDir()
+	dir := reasonixHomeDir()
 	if dir == "" {
 		return ""
 	}
@@ -317,9 +368,50 @@ func MemoryCompilerDir(workspaceRoot string) string {
 }
 
 // WorkspaceSlug flattens an absolute workspace path into the directory name
-// used under <config root>/projects.
+// used under <config root>/projects. Windows spells the same folder with
+// varying case (drive-letter case, Explorer renames), so the slug folds case
+// there — matching agent.CanonicalSessionPath's key form — or equivalent
+// spellings of one workspace would produce distinct slug strings. Existing
+// mixed-case slug directories need no migration: NTFS resolves names
+// case-insensitively, so the folded slug opens the same directory.
 func WorkspaceSlug(absPath string) string {
-	return strings.NewReplacer(string(os.PathSeparator), "-", "/", "-", "\\", "-", ":", "-").Replace(absPath)
+	if runtimeGOOS == "windows" {
+		absPath = strings.ToLower(absPath)
+	}
+	slug := strings.NewReplacer(string(os.PathSeparator), "-", "/", "-", "\\", "-", ":", "-").Replace(absPath)
+	return boundFilenameComponent(slug, 255)
+}
+
+// boundFilenameComponent caps a derived filename component at the common
+// per-component filesystem limit (255 bytes on ext4/APFS/NTFS). maxLen is the
+// byte budget for this component (path segments pass 255; names that gain an
+// extension pass 255 minus the extension length). Inputs at or under the
+// budget pass through byte-identical — every component that ever existed on
+// disk is under the budget, or it could not have been created — so existing
+// directories and files keep resolving. Only inputs that would previously
+// have failed with ENAMETOOLONG are truncated, with an FNV-1a hash of the
+// full input appended so distinct deep paths cannot collapse to one name.
+func boundFilenameComponent(s string, maxLen int) string {
+	if maxLen <= 0 || len(s) <= maxLen {
+		return s
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(s))
+	budget := maxLen - 17 // room for "-" + 16 hex digits
+	prefix := s[:budget]
+	// Back off to a rune boundary so a multi-byte character is never split.
+	for len(prefix) > 0 && !utf8.ValidString(prefix) {
+		prefix = prefix[:len(prefix)-1]
+	}
+	return fmt.Sprintf("%s-%016x", prefix, h.Sum64())
+}
+
+// BoundFilenameComponent is the exported form for sibling packages deriving
+// filename components from unbounded input. maxLen is the byte budget for the
+// component (pass 255 for a bare path segment; subtract the extension length
+// when one will be appended).
+func BoundFilenameComponent(s string, maxLen int) string {
+	return boundFilenameComponent(s, maxLen)
 }
 
 // CacheDir is the per-user cache root for derived/regenerable artefacts: MCP

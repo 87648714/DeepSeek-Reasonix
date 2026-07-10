@@ -19,10 +19,12 @@ import (
 	"reasonix/internal/control"
 	"reasonix/internal/event"
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/jobs"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
 	"reasonix/internal/store"
+	"reasonix/internal/tool/builtin"
 )
 
 // SessionParams is everything a Factory needs to assemble one ACP session's
@@ -35,13 +37,22 @@ import (
 // Cwd roots the session's file tools and bash (built via builtin.Workspace).
 // Model and EffortOverride are optional session-local provider selectors from
 // ACP config options. MCPServers are the MCP servers the client asked the agent
-// to connect for this session.
+// to connect for this session. OnSessionRecovered is the service's bookkeeping
+// hook for automatic transcript recovery branches (see sessionRecoveredHandler);
+// factories must wire it into the controller they build.
 type SessionParams struct {
-	Cwd            string
-	MCPServers     []plugin.Spec
-	Sink           event.Sink
-	Model          string
-	EffortOverride *string
+	Cwd                string
+	MCPServers         []plugin.Spec
+	Sink               event.Sink
+	Model              string
+	EffortOverride     *string
+	OnSessionRecovered func(control.SessionRecoveryInfo) error
+	// FileOverlay and Terminal are non-nil when the client advertised the
+	// matching capability at initialize: file tools then see unsaved editor
+	// buffers, and foreground bash can run in a client-owned terminal.
+	// Factories thread them into the controller's tool assembly.
+	FileOverlay builtin.FileOverlay
+	Terminal    builtin.TerminalRunner
 }
 
 // Factory builds the per-session controller. The composition root (the cli's
@@ -113,6 +124,7 @@ func Serve(ctx context.Context, r io.Reader, w io.Writer, factory Factory, info 
 	conn.Handle("session/prompt", svc.sessionPrompt)
 	conn.Handle("session/set_config_option", svc.sessionSetConfigOption)
 	conn.Handle("session/set_model", svc.sessionSetModel)
+	conn.Handle("session/set_mode", svc.sessionSetMode)
 	conn.Handle("session/close", svc.sessionClose)
 	conn.Handle("session/list", svc.sessionList)
 	conn.Handle("session/delete", svc.sessionDelete)
@@ -130,6 +142,38 @@ type service struct {
 
 	mu       sync.Mutex
 	sessions map[string]*acpSession
+	// clientCaps is what the client offered at initialize (fs proxy, host
+	// terminals). Zero until initialize arrives; sessions opened later bind a
+	// clientIO built from it.
+	clientCaps ClientCapabilities
+}
+
+func (s *service) setClientCapabilities(caps ClientCapabilities) {
+	s.mu.Lock()
+	s.clientCaps = caps
+	s.mu.Unlock()
+}
+
+func (s *service) clientCapabilities() ClientCapabilities {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clientCaps
+}
+
+// bindClientIO fills SessionParams' overlay/terminal fields from the client's
+// declared capabilities. The nil checks keep absent capabilities as nil
+// interface fields (a typed-nil *clientIO must never reach the interface).
+func (s *service) bindClientIO(p *SessionParams, sessionID string) {
+	io := newClientIO(s.conn, sessionID, s.clientCapabilities())
+	if !io.hasAny() {
+		return
+	}
+	if fo := io.fileOverlay(); fo != nil {
+		p.FileOverlay = fo
+	}
+	if tr := io.terminalRunner(); tr != nil {
+		p.Terminal = tr
+	}
 }
 
 // acpController is the slice of the controller's driving port the ACP transport
@@ -143,6 +187,9 @@ type acpController interface {
 	control.Approvals
 	control.Capabilities
 	control.SessionPersistence
+	// Goals is included for the session-mode surface only (PlanMode read-back
+	// after a turn); the goal FSM itself is not driven over ACP.
+	control.Goals
 }
 
 // acpSession is one open session: its controller, the on-disk transcript path
@@ -158,22 +205,39 @@ type acpSession struct {
 	model      string
 	// nil means use config; non-nil empty string means provider default.
 	effortOverride *string
-	pendingConfig  *SessionConfigState
-	title          string
-	createdAt      time.Time
-	updatedAt      time.Time
+	// modeID is the ACP session mode last reported to the client (default |
+	// plan | auto). Guarded by mu; compared after each turn so controller-side
+	// flips (plan mode auto-exit) surface as current_mode_update.
+	modeID        string
+	pendingConfig *SessionConfigState
+	title         string
+	createdAt     time.Time
+	updatedAt     time.Time
 
 	mu      sync.Mutex
 	cancel  context.CancelFunc
 	done    chan struct{}
 	running bool
 	deleted bool
+	// lease is the session lease guarding transcript against other runtimes
+	// (a desktop window, the CLI) for the life of this session. Held from
+	// session/new / session/load and released on close/delete/teardown.
+	// Config rebuilds keep the same transcript; when a snapshot conflict
+	// retargets the controller to a recovery branch, sessionRecoveredHandler
+	// moves transcript and this lease to the recovery file at commit time.
+	lease *agent.SessionLease
+	// maintenanceDone is non-nil while session-owned maintenance, such as an
+	// idle config rebuild, is in flight outside mu.
+	maintenanceDone chan struct{}
 }
 
 func (s *acpSession) begin(ctx context.Context) (context.Context, context.CancelFunc, bool) {
 	runCtx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
-	if s.running || s.deleted {
+	// A queued pendingConfig blocks new turns so a prompt never runs on the
+	// outgoing config. The turn or maintenance that queued it applies it from
+	// its defer, so no new turn is needed to drain the queue.
+	if s.running || s.deleted || s.maintenanceDone != nil || s.pendingConfig != nil {
 		s.mu.Unlock()
 		cancel()
 		return nil, nil, false
@@ -210,12 +274,16 @@ func (s *acpSession) abortAndWait() {
 	s.mu.Lock()
 	c := s.cancel
 	done := s.done
+	maintenanceDone := s.maintenanceDone
 	s.mu.Unlock()
 	if c != nil {
 		c()
 	}
 	if done != nil {
 		<-done
+	}
+	if maintenanceDone != nil {
+		<-maintenanceDone
 	}
 }
 
@@ -224,6 +292,7 @@ func (s *acpSession) deleteAndWait() {
 	s.deleted = true
 	c := s.cancel
 	done := s.done
+	maintenanceDone := s.maintenanceDone
 	s.mu.Unlock()
 	if c != nil {
 		c()
@@ -231,13 +300,164 @@ func (s *acpSession) deleteAndWait() {
 	if done != nil {
 		<-done
 	}
+	if maintenanceDone != nil {
+		<-maintenanceDone
+	}
+}
+
+func (s *acpSession) finishMaintenance(done chan struct{}) {
+	if done == nil {
+		return
+	}
+	closeDone := false
+	s.mu.Lock()
+	if s.maintenanceDone == done {
+		s.maintenanceDone = nil
+		closeDone = true
+	}
+	s.mu.Unlock()
+	if closeDone {
+		close(done)
+	}
+}
+
+// swapModeID records the mode reported to the client and returns the previous
+// value, so callers can emit current_mode_update only on change.
+func (s *acpSession) swapModeID(id string) (old string) {
+	s.mu.Lock()
+	old = s.modeID
+	s.modeID = id
+	s.mu.Unlock()
+	return old
+}
+
+// currentModeID returns the mode last reported to the client.
+func (s *acpSession) currentModeID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.modeID == "" {
+		return sessionModeDefault
+	}
+	return s.modeID
+}
+
+// currentCtrl returns the session's controller under mu. rebuildSession swaps
+// ctrl while holding mu, so any read of the field outside mu races with a
+// concurrent config rebuild; always go through this accessor unless mu is
+// already held.
+func (s *acpSession) currentCtrl() acpController {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ctrl
+}
+
+// releaseSessionLease drops the session's transcript lease, if any. Idempotent.
+func (s *acpSession) releaseSessionLease() {
+	s.mu.Lock()
+	lease := s.lease
+	s.lease = nil
+	s.mu.Unlock()
+	if lease != nil {
+		lease.Release()
+	}
+}
+
+// sessionLeaseBindError maps a lease-acquisition failure to the protocol
+// error the client sees: a held session names its holder with the shared CLI
+// wording; anything else is an internal error.
+func sessionLeaseBindError(method string, err error) *RPCError {
+	if errors.Is(err, agent.ErrSessionLeaseHeld) {
+		return &RPCError{
+			Code:    ErrInvalidRequest,
+			Message: method + ": " + control.SessionInUseMessage(err) + "; " + control.SessionLeaseCloseHint,
+		}
+	}
+	return &RPCError{Code: ErrInternal, Message: method + ": session lease: " + err.Error()}
+}
+
+// sessionRecoveredHandler returns the OnSessionRecovered callback wired into
+// every controller built for session id. When a snapshot conflict retargets
+// the controller to a recovery branch (turn-end autosave in persistAfterTurn,
+// or the pre-rebuild snapshot in rebuildSession), the ACP bookkeeping must
+// follow at commit time: session/prompt reports sess.transcript,
+// session/delete destroys it, and the session lease must guard the file the
+// controller actually writes. The recovery lease is acquired before the old
+// one is released so the outgoing transcript stays guarded until the new one
+// is secured; a failure aborts the recovery commit and the controller stays
+// on the original path (the next save retries).
+func (s *service) sessionRecoveredHandler(id string) func(control.SessionRecoveryInfo) error {
+	return func(info control.SessionRecoveryInfo) error {
+		recoveryPath := strings.TrimSpace(info.RecoveryPath)
+		if recoveryPath == "" {
+			return nil
+		}
+		sess := s.session(id)
+		if sess == nil {
+			return nil
+		}
+		lease, err := agent.TryAcquireSessionLease(recoveryPath)
+		if err != nil {
+			if errors.Is(err, agent.ErrSessionLeaseHeld) {
+				return fmt.Errorf("bind recovery session: %s; %s",
+					control.SessionInUseMessage(err), control.SessionLeaseCloseHint)
+			}
+			return fmt.Errorf("bind recovery session: %w", err)
+		}
+		sess.mu.Lock()
+		if sess.deleted {
+			sess.mu.Unlock()
+			lease.Release()
+			return fmt.Errorf("bind recovery session: session is deleted")
+		}
+		old := sess.lease
+		sess.lease = lease
+		sess.transcript = recoveryPath
+		meta := sess.metaLocked()
+		sess.mu.Unlock()
+		if old != nil {
+			old.Release()
+		}
+		_ = saveACPMeta(recoveryPath, meta)
+		// Leave a redirect on the id-keyed sidecar so restart-time lookups
+		// (session/load, session/resume, session/delete, loadMeta) resolve the
+		// id to the recovery file; without it the next process reopens the
+		// pre-recovery transcript. Always written against the id-keyed path,
+		// so resolution stays a single hop even for recovery-of-recovery.
+		if dir := s.sessionDir(); dir != "" {
+			if idPath := transcriptPath(dir, id); idPath != recoveryPath {
+				idMeta, _, err := loadACPMeta(idPath)
+				if err != nil {
+					slog.Warn("acp: load id-keyed meta for recovery redirect", "err", err)
+					idMeta = acpSessionMeta{}
+				}
+				if idMeta.SessionID == "" {
+					idMeta.SessionID = id
+				}
+				if idMeta.Cwd == "" {
+					idMeta.Cwd = meta.Cwd
+				}
+				if idMeta.CreatedAt.IsZero() {
+					idMeta.CreatedAt = meta.CreatedAt
+				}
+				idMeta.ActiveTranscript = filepath.Base(recoveryPath)
+				if err := saveACPMeta(idPath, idMeta); err != nil {
+					slog.Warn("acp: save recovery redirect", "err", err)
+				}
+			}
+		}
+		return nil
+	}
 }
 
 // initialize advertises the agent's capability set: persisted load plus ACP v1
 // list/resume/close/delete lifecycle helpers, prompts carrying inline resource
 // text (embeddedContext) but not image/audio, and stdio / Streamable HTTP MCP
 // (no legacy sse).
-func (s *service) initialize(_ context.Context, _ json.RawMessage) (any, error) {
+func (s *service) initialize(_ context.Context, raw json.RawMessage) (any, error) {
+	var p InitializeParams
+	if len(raw) > 0 && json.Unmarshal(raw, &p) == nil {
+		s.setClientCapabilities(p.ClientCapabilities)
+	}
 	return InitializeResult{
 		ProtocolVersion: ProtocolVersion,
 		AgentCapabilities: AgentCapabilities{
@@ -311,13 +531,17 @@ func (s *service) sessionNew(ctx context.Context, raw json.RawMessage) (any, err
 	}
 
 	sink := newUpdateSink(s.conn, id)
-	ctrl, err := s.factory.NewSession(ctx, SessionParams{
-		Cwd:            cwd,
-		MCPServers:     mcpServers,
-		Sink:           sink,
-		Model:          cfgState.Model,
-		EffortOverride: cloneStringPtr(cfgState.EffortOverride),
-	})
+	sink.bindCwd(cwd)
+	sessionParams := SessionParams{
+		Cwd:                cwd,
+		MCPServers:         mcpServers,
+		Sink:               sink,
+		Model:              cfgState.Model,
+		EffortOverride:     cloneStringPtr(cfgState.EffortOverride),
+		OnSessionRecovered: s.sessionRecoveredHandler(id),
+	}
+	s.bindClientIO(&sessionParams, id)
+	ctrl, err := s.factory.NewSession(ctx, sessionParams)
 	if err != nil {
 		return nil, &RPCError{Code: ErrInternal, Message: "session/new: " + err.Error()}
 	}
@@ -334,14 +558,23 @@ func (s *service) sessionNew(ctx context.Context, raw json.RawMessage) (any, err
 		mcpServers:     clonePluginSpecs(mcpServers),
 		model:          cfgState.Model,
 		effortOverride: cloneStringPtr(cfgState.EffortOverride),
+		modeID:         sessionModeDefault,
 		createdAt:      now,
 		updatedAt:      now,
 	}
 	// Pin a transcript file keyed by session id when the controller has a session
 	// dir, so every turn auto-saves there, session/prompt can hand the path back,
-	// and session/load can find it again by id across process restarts.
+	// and session/load can find it again by id across process restarts. The
+	// session lease is taken with it (defensive: the id-keyed path is brand new)
+	// so no other runtime can bind the transcript while this session lives.
 	if dir := ctrl.SessionDir(); dir != "" {
 		sess.transcript = transcriptPath(dir, id)
+		lease, err := agent.TryAcquireSessionLease(sess.transcript)
+		if err != nil {
+			ctrl.Close()
+			return nil, sessionLeaseBindError("session/new", err)
+		}
+		sess.lease = lease
 		ctrl.SetSessionPath(sess.transcript)
 	}
 
@@ -353,8 +586,74 @@ func (s *service) sessionNew(ctx context.Context, raw json.RawMessage) (any, err
 	return SessionNewResult{
 		SessionID:     id,
 		Models:        cfgState.Models,
+		Modes:         sessionModesState(sessionModeDefault),
 		ConfigOptions: cfgState.ConfigOptions,
 	}, nil
+}
+
+// Session modes exposed over ACP, mapped onto the controller's approval
+// switches: default asks per write-capable call, plan flips the read-only plan
+// gate, auto approves tool calls without asking.
+const (
+	sessionModeDefault = "default"
+	sessionModePlan    = "plan"
+	sessionModeAuto    = "auto"
+)
+
+func sessionModesState(current string) *SessionModeState {
+	return &SessionModeState{
+		CurrentModeID: current,
+		AvailableModes: []SessionMode{
+			{ID: sessionModeDefault, Name: "Always Ask", Description: "Ask before write-capable tool calls"},
+			{ID: sessionModePlan, Name: "Plan", Description: "Read-only research and planning; no writes or commands"},
+			{ID: sessionModeAuto, Name: "Auto-Approve", Description: "Run tool calls without asking"},
+		},
+	}
+}
+
+// sessionSetMode switches the session's operating mode and confirms it with a
+// current_mode_update, per the ACP session-mode contract.
+func (s *service) sessionSetMode(_ context.Context, raw json.RawMessage) (any, error) {
+	var p SessionSetModeParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &RPCError{Code: ErrInvalidParams, Message: "session/set_mode: " + err.Error()}
+	}
+	sess := s.session(p.SessionID)
+	if sess == nil {
+		return nil, &RPCError{Code: ErrInvalidParams, Message: "session/set_mode: unknown session " + p.SessionID}
+	}
+	ctrl := sess.currentCtrl()
+	switch p.ModeID {
+	case sessionModeDefault:
+		ctrl.SetMode(false, false)
+	case sessionModePlan:
+		ctrl.SetMode(true, false)
+	case sessionModeAuto:
+		ctrl.SetMode(false, true)
+	default:
+		return nil, &RPCError{Code: ErrInvalidParams, Message: "session/set_mode: unknown modeId " + p.ModeID}
+	}
+	if sess.swapModeID(p.ModeID) != p.ModeID {
+		sess.sink.send(currentModeUpdate{SessionUpdate: "current_mode_update", CurrentModeID: p.ModeID})
+	}
+	return SessionSetModeResult{}, nil
+}
+
+// emitModeDrift reports controller-side mode flips (plan mode auto-exits when
+// a plan is approved, a config rebuild resets switches) as current_mode_update
+// so the client's mode picker stays truthful.
+func (s *service) emitModeDrift(sess *acpSession) {
+	ctrl := sess.currentCtrl()
+	current := sessionModeDefault
+	switch {
+	case ctrl.PlanMode():
+		current = sessionModePlan
+	case ctrl.AutoApproveTools():
+		current = sessionModeAuto
+	}
+	if sess.swapModeID(current) != current {
+		sess.sink.send(currentModeUpdate{SessionUpdate: "current_mode_update", CurrentModeID: current})
+	}
 }
 
 // sessionLoad resumes a previously-saved session by id: it builds a controller
@@ -371,7 +670,17 @@ func (s *service) sessionLoad(ctx context.Context, raw json.RawMessage) (any, er
 	if err != nil {
 		return nil, err
 	}
-	return SessionLoadResult{Models: cfgState.Models, ConfigOptions: cfgState.ConfigOptions}, nil
+	return SessionLoadResult{Models: cfgState.Models, Modes: s.sessionModesFor(p.SessionID), ConfigOptions: cfgState.ConfigOptions}, nil
+}
+
+// sessionModesFor reports the modes state for a just-opened session: a session
+// already live in this process keeps whatever mode the user put it in (plan /
+// auto), so load/resume must not tell a reconnecting client "default".
+func (s *service) sessionModesFor(id string) *SessionModeState {
+	if sess := s.session(id); sess != nil {
+		return sessionModesState(sess.currentModeID())
+	}
+	return sessionModesState(sessionModeDefault)
 }
 
 // sessionResume restores a previously-saved session without replaying its
@@ -385,7 +694,7 @@ func (s *service) sessionResume(ctx context.Context, raw json.RawMessage) (any, 
 	if err != nil {
 		return nil, err
 	}
-	return SessionResumeResult{Models: cfgState.Models, ConfigOptions: cfgState.ConfigOptions}, nil
+	return SessionResumeResult{Models: cfgState.Models, Modes: s.sessionModesFor(p.SessionID), ConfigOptions: cfgState.ConfigOptions}, nil
 }
 
 func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam string, servers []MCPServerSpec, replay bool) (SessionConfigState, error) {
@@ -406,7 +715,10 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 			return SessionConfigState{}, &RPCError{Code: ErrInvalidParams, Message: method + ": unknown session " + id}
 		}
 		if replay {
-			newUpdateSink(s.conn, id).replay(sess.ctrl.History())
+			ctrl := sess.currentCtrl()
+			replaySink := newUpdateSink(s.conn, id)
+			replaySink.bindCwd(sess.cwd)
+			replaySink.replay(ctrl.History())
 		}
 		cfgState, err := s.configStateForSession(ctx, sess)
 		if err != nil {
@@ -418,7 +730,7 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 	var saved acpSessionMeta
 	persistedPath := ""
 	if dir := s.sessionDir(); dir != "" {
-		persistedPath = transcriptPath(dir, id)
+		persistedPath = resolveTranscriptPath(dir, id)
 		if agent.IsCleanupPending(persistedPath) {
 			return SessionConfigState{}, &RPCError{Code: ErrInvalidParams, Message: method + ": unknown session " + id}
 		}
@@ -442,13 +754,17 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 	}
 
 	sink := newUpdateSink(s.conn, id)
-	ctrl, err := s.factory.NewSession(ctx, SessionParams{
-		Cwd:            cwd,
-		MCPServers:     mcpServers,
-		Sink:           sink,
-		Model:          cfgState.Model,
-		EffortOverride: cloneStringPtr(cfgState.EffortOverride),
-	})
+	sink.bindCwd(cwd)
+	sessionParams := SessionParams{
+		Cwd:                cwd,
+		MCPServers:         mcpServers,
+		Sink:               sink,
+		Model:              cfgState.Model,
+		EffortOverride:     cloneStringPtr(cfgState.EffortOverride),
+		OnSessionRecovered: s.sessionRecoveredHandler(id),
+	}
+	s.bindClientIO(&sessionParams, id)
+	ctrl, err := s.factory.NewSession(ctx, sessionParams)
 	if err != nil {
 		return SessionConfigState{}, &RPCError{Code: ErrInternal, Message: method + ": " + err.Error()}
 	}
@@ -461,13 +777,22 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 		ctrl.Close()
 		return SessionConfigState{}, &RPCError{Code: ErrInternal, Message: method + ": persistence is disabled"}
 	}
-	path := transcriptPath(dir, id)
+	path := resolveTranscriptPath(dir, id)
 	if path != persistedPath && agent.IsCleanupPending(path) {
 		ctrl.Close()
 		return SessionConfigState{}, &RPCError{Code: ErrInvalidParams, Message: method + ": unknown session " + id}
 	}
+	// Bind the transcript for writing only if no other runtime (a desktop
+	// window, the CLI) holds it; the editor should not silently double-write a
+	// session that is open elsewhere.
+	lease, leaseErr := agent.TryAcquireSessionLease(path)
+	if leaseErr != nil {
+		ctrl.Close()
+		return SessionConfigState{}, sessionLeaseBindError(method, leaseErr)
+	}
 	loaded, err := agent.LoadSession(path)
 	if err != nil {
+		lease.Release()
 		ctrl.Close()
 		return SessionConfigState{}, &RPCError{Code: ErrInvalidParams, Message: method + ": unknown session " + id}
 	}
@@ -485,11 +810,14 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 		mcpServers:     clonePluginSpecs(mcpServers),
 		model:          cfgState.Model,
 		effortOverride: cloneStringPtr(cfgState.EffortOverride),
+		modeID:         sessionModeDefault,
 		title:          meta.Title,
 		createdAt:      meta.CreatedAt,
 		updatedAt:      meta.UpdatedAt,
+		lease:          lease,
 	}
 	if err := saveACPMeta(path, sess.meta()); err != nil {
+		sess.releaseSessionLease()
 		ctrl.Close()
 		return SessionConfigState{}, &RPCError{Code: ErrInternal, Message: method + ": " + err.Error()}
 	}
@@ -509,6 +837,38 @@ func (s *service) openExistingSession(ctx context.Context, method, id, cwdParam 
 // chat/run session files (those are addressed by a picker, not by id).
 func transcriptPath(dir, id string) string {
 	return filepath.Join(dir, id+".jsonl")
+}
+
+// resolveTranscriptPath returns the transcript file session id currently
+// lives in. That is the id-keyed path by default; after a snapshot recovery
+// moved the live session onto a recovery branch, the id-keyed sidecar carries
+// an ActiveTranscript redirect (written by sessionRecoveredHandler) that
+// load/resume/delete/meta lookups must follow, or a restart silently reopens
+// the pre-recovery transcript. The redirect is a basename, must stay inside
+// dir, and its target must exist and claim the same session id; anything else
+// falls back to the id-keyed path.
+func resolveTranscriptPath(dir, id string) string {
+	path := transcriptPath(dir, id)
+	meta, ok, err := loadACPMeta(path)
+	if err != nil || !ok {
+		return path
+	}
+	active := strings.TrimSpace(meta.ActiveTranscript)
+	if active == "" || active == filepath.Base(path) {
+		return path
+	}
+	if filepath.Base(active) != active {
+		return path
+	}
+	resolved := filepath.Join(dir, active)
+	if !sessionFileExists(resolved) {
+		return path
+	}
+	targetMeta, ok, err := loadACPMeta(resolved)
+	if err != nil || !ok || targetMeta.SessionID != id {
+		return path
+	}
+	return resolved
 }
 
 // sessionPrompt runs one turn. It flattens the prompt blocks to text and runs the
@@ -538,14 +898,8 @@ func (s *service) sessionPrompt(ctx context.Context, raw json.RawMessage) (any, 
 	defer func() {
 		sess.sink.clearTurnContext()
 		sess.finish()
-		if err := s.applyPendingSessionConfig(ctx, sess); err != nil {
-			sess.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "session config switch failed after turn: " + err.Error()})
-			if isSessionConfigActiveWorkError(err) {
-				if current, stateErr := s.configStateForSession(ctx, sess); stateErr == nil {
-					sess.sink.send(configOptionUpdate{SessionUpdate: "config_option_update", ConfigOptions: current.ConfigOptions})
-				}
-			}
-		}
+		s.reportPendingSessionConfigError(ctx, sess, s.applyPendingSessionConfig(ctx, sess), "after turn")
+		s.emitModeDrift(sess)
 		cancel()
 	}()
 	runErr := sess.ctrl.RunTurn(runCtx, text)
@@ -657,7 +1011,7 @@ func (s *service) switchSessionEffort(ctx context.Context, sess *acpSession, eff
 	return cfgState, nil
 }
 
-func (s *service) rebuildSession(ctx context.Context, sess *acpSession, cfgState SessionConfigState) error {
+func (s *service) rebuildSession(ctx context.Context, sess *acpSession, cfgState SessionConfigState) (retErr error) {
 	sess.mu.Lock()
 	if sess.deleted {
 		sess.mu.Unlock()
@@ -672,41 +1026,73 @@ func (s *service) rebuildSession(ctx context.Context, sess *acpSession, cfgState
 		sess.mu.Unlock()
 		return sessionConfigActiveWorkError("stop background jobs before switching config")
 	}
-	if sess.running || status.Running {
+	if sess.running || status.Running || sess.maintenanceDone != nil {
 		pending := cloneSessionConfigState(cfgState)
 		sess.pendingConfig = &pending
 		sess.mu.Unlock()
 		sess.sink.send(configOptionUpdate{SessionUpdate: "config_option_update", ConfigOptions: cfgState.ConfigOptions})
 		return nil
 	}
+	// Claim the queue in the same critical section that raises maintenanceDone
+	// below: begin must never observe an idle session between the two.
 	sess.pendingConfig = nil
 
 	cur := sess.ctrl
-	prevPath := cur.SessionPath()
-	if err := cur.Snapshot(); err != nil {
-		sess.mu.Unlock()
-		return &RPCError{Code: ErrInternal, Message: "session config: snapshot before switch: " + err.Error()}
-	}
-	carried := cur.History()
 	sink := sess.sink
 	mcpServers := clonePluginSpecs(sess.mcpServers)
 	cwd := sess.cwd
+	maintenanceDone := make(chan struct{})
+	sess.maintenanceDone = maintenanceDone
+	sess.mu.Unlock()
+	defer func() {
+		sess.finishMaintenance(maintenanceDone)
+		if retErr == nil {
+			s.reportPendingSessionConfigError(ctx, sess, s.applyPendingSessionConfig(ctx, sess), "after maintenance")
+		}
+	}()
 
-	newCtrl, err := s.factory.NewSession(ctx, SessionParams{
-		Cwd:            cwd,
-		MCPServers:     mcpServers,
-		Sink:           sink,
-		Model:          cfgState.Model,
-		EffortOverride: cloneStringPtr(cfgState.EffortOverride),
-	})
+	if err := cur.Snapshot(); err != nil {
+		return &RPCError{Code: ErrInternal, Message: "session config: snapshot before switch: " + err.Error()}
+	}
+	// Capture the adopt path and history only after Snapshot: a snapshot
+	// conflict can retarget cur to a recovery branch (or adopt the newer disk
+	// transcript), and a pre-snapshot capture would bind the rebuilt controller
+	// back to the original file, re-conflicting on every later save. When that
+	// recovery fired, sessionRecoveredHandler already moved sess.transcript
+	// and the session lease to the recovery file, so prevPath, the session
+	// bookkeeping, and the controller agree on one path here.
+	// SessionPath is controller-locked, so reading it off sess.mu is safe.
+	prevPath := cur.SessionPath()
+	carried := cur.History()
+
+	rebuildParams := SessionParams{
+		Cwd:                cwd,
+		MCPServers:         mcpServers,
+		Sink:               sink,
+		Model:              cfgState.Model,
+		EffortOverride:     cloneStringPtr(cfgState.EffortOverride),
+		OnSessionRecovered: s.sessionRecoveredHandler(sess.id),
+	}
+	// The rebuilt controller must keep the client-capability wiring (fs
+	// overlay, host terminal) a model/effort switch would otherwise drop.
+	s.bindClientIO(&rebuildParams, sess.id)
+	newCtrl, err := s.factory.NewSession(ctx, rebuildParams)
 	if err != nil {
-		sess.mu.Unlock()
 		return &RPCError{Code: ErrInternal, Message: "session config: " + err.Error()}
 	}
 	newCtrl.EnableInteractiveApproval()
 	sink.bindApprove(newCtrl.Approve)
 	sink.bindAnswer(newCtrl.AnswerQuestion)
 	newCtrl.AdoptHistory(carried, prevPath)
+	// Re-apply the session's ACP mode: a fresh controller boots with default
+	// switches, which would silently drop a user-selected plan/auto mode and
+	// desynchronize the client's mode picker.
+	switch sess.currentModeID() {
+	case sessionModePlan:
+		newCtrl.SetMode(true, false)
+	case sessionModeAuto:
+		newCtrl.SetMode(false, true)
+	}
 	// InheritLifecycleFrom wires two concrete controllers' turn/hook state; it's a
 	// construction concern, not part of the driving port. cur is always the
 	// *control.Controller the factory built for this session, so this is safe.
@@ -714,6 +1100,17 @@ func (s *service) rebuildSession(ctx context.Context, sess *acpSession, cfgState
 		newCtrl.InheritLifecycleFrom(prev)
 	}
 
+	sess.mu.Lock()
+	if sess.deleted {
+		sess.mu.Unlock()
+		newCtrl.Close()
+		return &RPCError{Code: ErrInvalidRequest, Message: "session config: session is deleted"}
+	}
+	if sess.ctrl != cur {
+		sess.mu.Unlock()
+		newCtrl.Close()
+		return sessionConfigActiveWorkError("session changed while switching config; retry")
+	}
 	sess.ctrl = newCtrl
 	sess.model = cfgState.Model
 	sess.effortOverride = cloneStringPtr(cfgState.EffortOverride)
@@ -738,21 +1135,35 @@ func (s *service) applyPendingSessionConfig(ctx context.Context, sess *acpSessio
 		return nil
 	}
 	cfgState := cloneSessionConfigState(*sess.pendingConfig)
-	sess.pendingConfig = nil
+	// Keep pendingConfig set while rebuilding: begin refuses new turns until
+	// rebuildSession claims it together with raising maintenanceDone, so no
+	// promptable instant is visible in between.
 	sess.mu.Unlock()
 
 	if err := s.rebuildSession(ctx, sess, cfgState); err != nil {
-		if !isSessionConfigActiveWorkError(err) {
-			sess.mu.Lock()
-			if !sess.deleted && sess.pendingConfig == nil {
-				pending := cloneSessionConfigState(cfgState)
-				sess.pendingConfig = &pending
-			}
-			sess.mu.Unlock()
+		// Once this attempt failed nothing in flight is left to retry a parked
+		// config, and begin refuses new turns while one is queued — drop it so
+		// the session stays promptable (the caller reports the failure).
+		sess.mu.Lock()
+		if !sess.deleted && !sess.running && sess.maintenanceDone == nil {
+			sess.pendingConfig = nil
 		}
+		sess.mu.Unlock()
 		return err
 	}
 	return nil
+}
+
+func (s *service) reportPendingSessionConfigError(ctx context.Context, sess *acpSession, err error, when string) {
+	if err == nil || sess == nil || sess.sink == nil {
+		return
+	}
+	sess.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "session config switch failed " + when + ": " + err.Error()})
+	if isSessionConfigActiveWorkError(err) {
+		if current, stateErr := s.configStateForSession(ctx, sess); stateErr == nil {
+			sess.sink.send(configOptionUpdate{SessionUpdate: "config_option_update", ConfigOptions: current.ConfigOptions})
+		}
+	}
 }
 
 type activeSessionConfigWorkError struct {
@@ -787,6 +1198,7 @@ func (s *service) sessionClose(_ context.Context, raw json.RawMessage) (any, err
 	if sess := s.takeSession(p.SessionID); sess != nil {
 		sess.abortAndWait()
 		sess.ctrl.Close()
+		sess.releaseSessionLease()
 	}
 	return SessionCloseResult{}, nil
 }
@@ -814,7 +1226,18 @@ func (s *service) sessionList(_ context.Context, raw json.RawMessage) (any, erro
 		if err != nil {
 			return nil, &RPCError{Code: ErrInternal, Message: "session/list: " + err.Error()}
 		}
+		// A recovered session has two sidecars claiming the same id: the
+		// active recovery transcript's own meta and the id-keyed redirect.
+		// Reduce to one representative per id before filtering, so the entry
+		// shown never carries the stale pre-recovery title/timestamps.
+		best := map[string]acpSessionMeta{}
 		for _, meta := range metas {
+			cur, ok := best[meta.SessionID]
+			if !ok || listMetaBeats(meta, cur) {
+				best[meta.SessionID] = meta
+			}
+		}
+		for _, meta := range best {
 			info := meta.info(nil)
 			if sessionInfoMatchesCwd(info, filterCwd) {
 				byID[info.SessionID] = info
@@ -859,6 +1282,10 @@ func (s *service) sessionDelete(_ context.Context, raw json.RawMessage) (any, er
 	var delayed bool
 	if sess := s.takeSession(p.SessionID); sess != nil {
 		sess.deleteAndWait()
+		// The session is going away; drop its lease before removing files so
+		// the lease sidecars retire with the release (they are not in
+		// SessionSidecarFiles and would otherwise linger).
+		sess.releaseSessionLease()
 		path = sess.transcript
 		destroy = sess.ctrl.BeginDestroySession(path)
 		if result := destroy.Wait(); result.HasTimedOut() {
@@ -874,7 +1301,7 @@ func (s *service) sessionDelete(_ context.Context, raw json.RawMessage) (any, er
 	}
 	if path == "" {
 		if dir := s.sessionDir(); dir != "" {
-			path = transcriptPath(dir, p.SessionID)
+			path = resolveTranscriptPath(dir, p.SessionID)
 		}
 	}
 	if path != "" && !delayed {
@@ -883,6 +1310,17 @@ func (s *service) sessionDelete(_ context.Context, raw json.RawMessage) (any, er
 		}
 		if destroy.Finish != nil {
 			destroy.Finish()
+		}
+	}
+	// A recovered session lives in two files: the recovery transcript (deleted
+	// above) and the id-keyed original holding the redirect. Remove the twin
+	// too, or it resurfaces in session/list as a ghost that delete-by-id can
+	// never reach again.
+	if dir := s.sessionDir(); dir != "" {
+		if idPath := transcriptPath(dir, p.SessionID); idPath != path {
+			if err := deleteSessionFiles(idPath); err != nil {
+				return nil, &RPCError{Code: ErrInternal, Message: "session/delete: " + err.Error()}
+			}
 		}
 	}
 	return SessionDeleteResult{}, nil
@@ -933,7 +1371,7 @@ func (s *service) sessionDir() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, sess := range s.sessions {
-		if dir := sess.ctrl.SessionDir(); dir != "" {
+		if dir := sess.currentCtrl().SessionDir(); dir != "" {
 			return dir
 		}
 	}
@@ -1065,7 +1503,7 @@ func (s *service) loadMeta(id string) (acpSessionMeta, bool) {
 	if dir == "" {
 		return acpSessionMeta{}, false
 	}
-	meta, ok, err := loadACPMeta(transcriptPath(dir, id))
+	meta, ok, err := loadACPMeta(resolveTranscriptPath(dir, id))
 	if err != nil {
 		return acpSessionMeta{}, false
 	}
@@ -1080,18 +1518,28 @@ func (s *service) closeAll() {
 	s.sessions = make(map[string]*acpSession)
 	s.mu.Unlock()
 	for _, sess := range sessions {
-		sess.abort()
-		sess.ctrl.Close()
+		sess.abortAndWait()
+		sess.currentCtrl().Close()
+		sess.releaseSessionLease()
 	}
 }
 
 func (s *acpSession) persistAfterTurn(prompt string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.deleted {
+		s.mu.Unlock()
 		return
 	}
-	_ = s.ctrl.Snapshot()
+	ctrl := s.ctrl
+	s.mu.Unlock()
+
+	_ = ctrl.Snapshot()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deleted || s.ctrl != ctrl {
+		return
+	}
 	if s.title == "" {
 		s.title = previewTitle(prompt)
 	}
@@ -1124,8 +1572,9 @@ func (s *acpSession) metaLocked() acpSessionMeta {
 
 func (s *acpSession) info() SessionInfo {
 	meta := s.meta()
+	ctrl := s.currentCtrl()
 	extra := map[string]any{}
-	if n := len(s.ctrl.History()); n > 0 {
+	if n := len(ctrl.History()); n > 0 {
 		extra["messageCount"] = n
 	}
 	if len(extra) == 0 {
@@ -1135,10 +1584,14 @@ func (s *acpSession) info() SessionInfo {
 }
 
 func (s *service) sendAvailableCommands(sess *acpSession) {
-	if sess == nil || sess.ctrl == nil {
+	if sess == nil {
 		return
 	}
-	cmds := availableCommandsFor(sess.ctrl)
+	ctrl := sess.currentCtrl()
+	if ctrl == nil {
+		return
+	}
+	cmds := availableCommandsFor(ctrl)
 	if len(cmds) == 0 {
 		return
 	}
@@ -1213,16 +1666,20 @@ func availableCommandsFor(ctrl acpController) []AvailableCommand {
 
 func (s *service) resolveSlashPrompt(ctx context.Context, sess *acpSession, text string) string {
 	line := strings.TrimSpace(text)
-	if sess == nil || sess.ctrl == nil || !strings.HasPrefix(line, "/") {
+	if sess == nil || !strings.HasPrefix(line, "/") {
 		return text
 	}
-	if sent, ok := sess.ctrl.CustomCommand(line); ok {
+	ctrl := sess.currentCtrl()
+	if ctrl == nil {
+		return text
+	}
+	if sent, ok := ctrl.CustomCommand(line); ok {
 		return sent
 	}
-	if sent, ok := sess.ctrl.RunSkill(line); ok {
+	if sent, ok := ctrl.RunSkill(line); ok {
 		return sent
 	}
-	if sent, ok, err := sess.ctrl.MCPPrompt(ctx, line); err == nil && ok {
+	if sent, ok, err := ctrl.MCPPrompt(ctx, line); err == nil && ok {
 		return sent
 	}
 	return text
@@ -1236,6 +1693,12 @@ type acpSessionMeta struct {
 	Title          string    `json:"title,omitempty"`
 	CreatedAt      time.Time `json:"createdAt"`
 	UpdatedAt      time.Time `json:"updatedAt"`
+	// ActiveTranscript, when set on the id-keyed sidecar, is the basename of
+	// the transcript this session currently lives in: a snapshot recovery
+	// moved the live session onto a recovery branch and left this redirect
+	// behind so restart-time lookups (resolveTranscriptPath) follow the
+	// session instead of reopening the pre-recovery file.
+	ActiveTranscript string `json:"activeTranscript,omitempty"`
 }
 
 func (m acpSessionMeta) info(extra map[string]any) SessionInfo {
@@ -1291,7 +1754,7 @@ func loadACPMeta(sessionPath string) (acpSessionMeta, bool, error) {
 	if path == "" {
 		return acpSessionMeta{}, false, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return acpSessionMeta{}, false, nil
@@ -1401,6 +1864,19 @@ func sessionIDFromTranscript(path string) string {
 	return base
 }
 
+// listMetaBeats reports whether a should represent its session id in
+// session/list over b. A meta without an ActiveTranscript redirect is the
+// session's live transcript and always beats a redirect sidecar; between two
+// of the same kind the later UpdatedAt wins.
+func listMetaBeats(a, b acpSessionMeta) bool {
+	aRedirect := strings.TrimSpace(a.ActiveTranscript) != ""
+	bRedirect := strings.TrimSpace(b.ActiveTranscript) != ""
+	if aRedirect != bRedirect {
+		return !aRedirect
+	}
+	return a.UpdatedAt.After(b.UpdatedAt)
+}
+
 func sessionInfoMatchesCwd(info SessionInfo, filter string) bool {
 	if filter == "" {
 		return true
@@ -1469,9 +1945,9 @@ func parseSessionUpdatedAt(s string) time.Time {
 func deleteSessionFiles(sessionPath string) error {
 	paths := []string{
 		sessionPath,
-		store.SessionMeta(sessionPath),
 		acpMetaPath(sessionPath),
 	}
+	paths = append(paths, store.SessionSidecarFiles(sessionPath)...)
 	for _, path := range paths {
 		if path == "" {
 			continue

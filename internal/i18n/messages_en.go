@@ -42,43 +42,82 @@ var English = Messages{
 	ResumePickTitle: "Resume a saved session",
 	ResumePickHint:  "↑/↓ move · Enter resume · Esc cancel",
 
-	ChatThinking:                "thinking…",
-	ChatThoughtForFmt:           "thought for %ds",
-	ChatStatusThinkingFmt:       "%s thinking… (%ds · Esc cancels)",
-	ChatToolWorkingFmt:          "%s working · %ds",
-	ChatStatusRetryingFmt:       "%s retrying (%d/%d)… (Esc cancels)",
-	ChatStatusCancellingFmt:     "%s stopping… (%ds · Ctrl+C exits)",
-	ChatStatusIdle:              "ready",
-	ChatStatusYoloIdle:          "tool approvals skipped",
-	ChatStatusCycleHint:         "shift+tab toggles plan · ctrl+y yolo",
-	ChatStatusCacheNowFmt:       "turn hit %s",
-	ChatStatusCacheAvgFmt:       "avg %s",
-	ChatStatusPlanApproval:      "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
-	PlanApprovalPrompt:          "Plan ready above — Enter/y to approve & execute, n/Esc to keep planning",
-	ChatStatusToolApproval:      "1 approve once · 2 allow scope this session · 3/4 prefix or save when offered · n/Esc deny · Ctrl-C cancels turn",
-	AskTypeSomething:            "Type something else",
-	AskTypingHint:               "type below, Enter to confirm",
-	AskChatInstead:              "None — just chat",
-	ChatStatusQuestion:          "↑/↓ move · number to pick · space multi · Enter confirm · ←/→ switch · Esc cancel",
-	StatusResumePicker:          "↑/↓ move · Enter resume · Esc cancel",
-	AskSubmitTitle:              "Submit answers",
-	AskUnanswered:               "(unanswered)",
-	AskSubmitHint:               "Enter submits · ← returns to edit",
-	ToolApprovalPromptFmt:       "Permission required\n\nWill call tool %s%s.\n%s\n%s",
-	ToolApprovalChoices:         "1. Allow once\n2. Allow %s for this session\n3. Always allow %s (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
-	BashPrefixChoices:           "1. Allow once\n2. Allow %s for this session\n3. Always allow %s (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
-	ToolApprovalSourceFmt:       "Source: %s",
-	ToolApprovalBuiltIn:         "built-in tool",
-	ToolApprovalImageUse:        "It will read provided image input for image understanding.",
-	PermissionSavedFmt:          "permission saved to %s: %s",
-	PermissionAlreadyAllowedFmt: "permission already covered in %s: %s",
-	PermissionSaveFailedFmt:     "permission save failed for %s: %v",
-	MCPReadOnlyTrustSavedFmt:    "MCP read-only trust saved to %s: %s/%s",
-	MCPReadOnlyTrustAlreadyFmt:  "MCP read-only trust already saved in %s: %s/%s",
-	MCPReadOnlyTrustFailedFmt:   "MCP read-only trust save failed for %s/%s: %v",
-	DiffFoldedFmt:               "… +%d more lines",
-	DiffFoldEnabledFmt:          "diff folded to %d lines (/diff-fold to expand)",
-	DiffFoldDisabled:            "diff expanded — showing all lines (/diff-fold to fold)",
+	ChatThinking:                           "thinking…",
+	ChatThoughtForFmt:                      "thought for %ds",
+	ChatStatusThinkingFmt:                  "%s thinking… (%ds · Esc cancels)",
+	ChatToolWorkingFmt:                     "%s working · %ds",
+	ChatStatusRetryingFmt:                  "%s retrying (%d/%d)… (Esc cancels)",
+	ChatStatusCancellingFmt:                "%s stopping… (%ds · Ctrl+C exits)",
+	ChatStatusIdle:                         "ready",
+	ChatStatusYoloIdle:                     "tool approvals skipped",
+	ChatStatusCycleHint:                    "shift+tab toggles plan · ctrl+y yolo",
+	ChatStatusCacheNowFmt:                  "turn hit %s",
+	ChatStatusCacheAvgFmt:                  "avg %s",
+	ChatStatusPlanApproval:                 "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn/Ctrl+Home/End scrolls",
+	PlanApprovalPrompt:                     "Plan ready above — Enter/y to approve & execute, n/Esc to keep planning",
+	ChatStatusToolApproval:                 "1 approve once · 2 allow scope this session · 3/4 prefix or save when offered · n/Esc deny · Ctrl-C cancels turn",
+	AskTypeSomething:                       "Type something else",
+	AskTypingHint:                          "type below, Enter to confirm",
+	AskChatInstead:                         "None — just chat",
+	ChatStatusQuestion:                     "↑/↓ move · number to pick · space multi · Enter confirm · ←/→ switch · Esc cancel",
+	StatusResumePicker:                     "↑/↓ move · Enter resume · Esc cancel",
+	AskSubmitTitle:                         "Submit answers",
+	AskUnanswered:                          "(unanswered)",
+	AskSubmitHint:                          "Enter submits · ← returns to edit",
+	ToolApprovalPromptFmt:                  "Permission required\n\nWill call tool %s%s.\n%s\n%s",
+	ToolApprovalChoices:                    "1. Allow once\n2. Allow %s for this session\n3. Always allow %s (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
+	BashPrefixChoices:                      "1. Allow once\n2. Allow %s for this session\n3. Always allow %s (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
+	PlanModeReadOnlyCommandChoices:         "1. Trust once\n2. Trust this prefix for this session\n3. Always trust this prefix for plan mode (save to config)\n4. Deny\nChoose [1/2/3/4] (y/a/p/n also work)",
+	FreshHumanApprovalChoices:              "1. Allow once\n2. Deny\nChoose [1/2] (y/n also work)",
+	SandboxEscapeApprovalChoices:           "1. Allow once\n2. Use real environment for this session\n3. Deny\nChoose [1/2/3] (y/a/n also work)",
+	ApprovalNeededFmt:                      "approval needed: %s",
+	ApprovalNeededWithSubjectFmt:           "approval needed: %s %s",
+	ToolApprovalSourceFmt:                  "Source: %s",
+	ToolApprovalBuiltIn:                    "built-in tool",
+	ToolApprovalImageUse:                   "It will read provided image input for image understanding.",
+	ApprovalToolLabelBash:                  "bash",
+	ApprovalToolLabelEditFile:              "edit file",
+	ApprovalToolLabelWriteFile:             "write file",
+	ApprovalToolLabelMultiEdit:             "multi edit",
+	ApprovalToolLabelMoveFile:              "move file",
+	ApprovalToolLabelWebFetch:              "web fetch",
+	ApprovalToolLabelRunSkill:              "run skill",
+	ApprovalToolLabelRemember:              "remember",
+	ApprovalToolLabelForget:                "forget",
+	ApprovalToolLabelSandboxEscape:         "bash sandbox escape",
+	ApprovalToolLabelPlanModeReadOnly:      "plan-mode read-only command",
+	MemoryApprovalSaveUpdate:               "Save/update memory",
+	MemoryApprovalBodyLabel:                "body",
+	MemoryApprovalArchiveFmt:               "Archive memory %q",
+	PlanModeMCPTrustMetadataMissing:        "this MCP tool did not expose enough metadata to remember a read-only trust decision.",
+	PlanModeMCPTrustSubjectFmt:             "MCP %s/%s as read-only for planning and research",
+	PlanModeMCPTrustReason:                 "This MCP tool reports read-only, but external read-only hints need your confirmation before plan mode can use them. Choose always allow to remember this trust for future planning and read-only research.",
+	PlanModeMCPTrustDeclined:               "the user declined to trust this MCP read-only hint - do not retry it; continue with other trusted read-only tools or ask how to proceed.",
+	PlanModeBashTrustSubjectFmt:            "Trust %q as a read-only command prefix while planning\nCommand: %s",
+	PlanModeBashTrustReason:                "This bash command is not in Reasonix's built-in read-only set. Confirm only if this exact prefix is read-only for planning and research. Auto/YOLO approval cannot answer this trust prompt.",
+	PlanModeBashTrustDeclined:              "the user declined to trust this bash command as read-only for plan mode - do not retry it; continue with other trusted read-only tools or ask how to proceed.",
+	SandboxEscapeSubjectFallback:           "run shell command unconfined once",
+	SandboxEscapeSubjectPrefix:             "run unconfined once: ",
+	SandboxEscapeWrapReason:                "Windows sandbox could not wrap this command. Run it unconfined one time? This bypasses the OS sandbox for this command only.",
+	SandboxEscapeRuntimeReason:             "Windows sandbox failed while starting this command. Run it unconfined one time? This bypasses the OS sandbox for this command only.",
+	SandboxEscapeDeclined:                  "the user declined to run this command without the OS sandbox - do not retry it unconfined; ask how they would like to proceed.",
+	ApprovalToolLabelConfigWrite:           "Reasonix config write",
+	ConfigWriteSubjectPrefix:               "write Reasonix config: ",
+	ConfigWriteReason:                      "This write targets a Reasonix-managed configuration file outside the workspace. It can change providers, sandbox rules, permissions, and MCP servers for future sessions, so it needs your explicit approval.",
+	ConfigWriteDeclined:                    "the user declined this Reasonix config write - do not retry it; ask how they would like to proceed.",
+	ConfigWriteApprovalChoices:             "1. Allow once\n2. Allow for this session\n3. Deny\nChoose [1/2/3] (y/a/n also work)",
+	PermissionSavedFmt:                     "permission saved to %s: %s",
+	PermissionAlreadyAllowedFmt:            "permission already covered in %s: %s",
+	PermissionSaveFailedFmt:                "permission save failed for %s: %v",
+	MCPReadOnlyTrustSavedFmt:               "MCP read-only trust saved to %s: %s/%s",
+	MCPReadOnlyTrustAlreadyFmt:             "MCP read-only trust already saved in %s: %s/%s",
+	MCPReadOnlyTrustFailedFmt:              "MCP read-only trust save failed for %s/%s: %v",
+	PlanModeReadOnlyCommandTrustSavedFmt:   "plan-mode read-only command trust saved to %s: %s",
+	PlanModeReadOnlyCommandTrustAlreadyFmt: "plan-mode read-only command trust already saved in %s: %s",
+	PlanModeReadOnlyCommandTrustFailedFmt:  "plan-mode read-only command trust save failed for %s: %v",
+	DiffFoldedFmt:                          "… +%d more lines",
+	DiffFoldEnabledFmt:                     "diff folded to %d lines (/diff-fold to expand)",
+	DiffFoldDisabled:                       "diff expanded — showing all lines (/diff-fold to fold)",
 
 	OutputStyleNone:    "no output styles available",
 	OutputStyleHeader:  "output styles:",
@@ -243,7 +282,7 @@ var English = Messages{
 	ListSkillsHeaderFmt: "skills (%d)",
 	ListSkillsNone:      "skills: none defined — invoke a built-in like /init, or author one with install_skill",
 	ListHooksHeaderFmt:  "hooks (%d active)",
-	ListHooksNone:       "hooks: none active — configure in .reasonix/settings.json (project, after trust) or ~/.reasonix/settings.json (global)",
+	ListHooksNone:       "hooks: none active — configure in .reasonix/settings.json (project, after trust) or <Reasonix home>/settings.json (global)",
 	ListMcpHeader:       "mcp servers",
 	ListMcpNone:         "mcp: no servers connected — add one in reasonix.toml ([[plugins]]) or a project .mcp.json",
 
@@ -386,8 +425,8 @@ var English = Messages{
 	UsageBody: `reasonix — a config- and plugin-driven coding agent (multi-model)
 
 Usage:
-  reasonix [--model NAME] [-c|--continue] [--resume] [--yolo] [--dir PATH]   interactive session (multi-turn; -c resumes the latest, --resume picks one)
-  reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] <task>   run one task and exit
+  reasonix [--model NAME] [-c|--continue] [--resume] [--copy] [--yolo] [--dir PATH]   interactive session (multi-turn; -c resumes the latest, --resume picks one, --copy continues in a duplicate)
+  reasonix run  [--model NAME] [--max-steps N] [-c|--continue] [--resume PATH] [--copy] <task>   run one task and exit
   reasonix review [--base BRANCH] [--commit SHA] [--model NAME]  AI-powered code review on local diffs
   reasonix serve [--model NAME] [--addr HOST:PORT] [--auth none|token|password] [--token STR] [--password STR] [--hash-password]  serve over HTTP+SSE (with optional auth)
   reasonix acp [--model NAME]                           serve Agent Client Protocol over stdio (also: reasonix --acp)
@@ -398,6 +437,7 @@ Usage:
   reasonix mcp <add|remove|list|import>                 manage MCP servers in reasonix.toml
   reasonix init                                         show how to generate project memory (AGENTS.md)
   reasonix doctor [--json]                              print redacted local diagnostics
+  reasonix doctor session <branch-id> [--zip] [--out PATH]  export a session conflict diagnostic zip
   reasonix bot start|doctor|weixin-login                multi-channel IM bot gateway
   reasonix upgrade [--check] [--force]                   self-update to the latest release (also: reasonix update)
   reasonix version
@@ -411,7 +451,7 @@ Examples:
   echo "explain this code" | reasonix run
 
 Configuration:
-  Resolution: flag > ./reasonix.toml > ~/.reasonix/config.toml > built-in defaults
+  Resolution: flag > ./reasonix.toml > <Reasonix home>/config.toml > built-in defaults
   Secrets come from the environment via api_key_env (e.g. DEEPSEEK_API_KEY).
   Run 'reasonix setup' to scaffold a config; see docs/SPEC.md.
 `,

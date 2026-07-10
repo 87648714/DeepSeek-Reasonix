@@ -6,6 +6,13 @@ import { app } from "../lib/bridge";
 import type { DirEntry } from "../lib/types";
 import { VirtualMenu } from "./VirtualMenu";
 
+const FILE_REF_SEARCH_CACHE_TTL_MS = 5000;
+
+type FileRefSearchCacheEntry = {
+  entries: DirEntry[];
+  cachedAt: number;
+};
+
 export function dirEntrySubmitPath(entry: DirEntry, atDir: string): string {
   return entry.path || atDir + entry.name;
 }
@@ -48,7 +55,7 @@ export function insertTextAtSelection(
   return { value: next, caret: before.length + text.length };
 }
 
-export function useFileReferenceMenu(text: string, cwd?: string) {
+export function useFileReferenceMenu(text: string, cwd?: string, tabId?: string, workspaceScopeKey?: string) {
   const token = useMemo(() => activeFileReferenceToken(text), [text]);
   const atRaw = token?.raw ?? null;
   const atDir = token?.dir ?? "";
@@ -58,19 +65,21 @@ export function useFileReferenceMenu(text: string, cwd?: string) {
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const dirCache = useRef<Record<string, DirEntry[]>>({});
-  const searchCache = useRef<Record<string, DirEntry[]>>({});
-  const prevCwdRef = useRef(cwd);
+  const searchCache = useRef<Record<string, FileRefSearchCacheEntry>>({});
+  const fileRefTabId = tabId ?? "";
+  const fileRefScopeKey = workspaceScopeKey ?? `${fileRefTabId}\u0000${cwd ?? ""}`;
+  const prevFileRefScopeRef = useRef(fileRefScopeKey);
 
   useEffect(() => {
-    if (prevCwdRef.current === cwd) return;
-    prevCwdRef.current = cwd;
+    if (prevFileRefScopeRef.current === fileRefScopeKey) return;
+    prevFileRefScopeRef.current = fileRefScopeKey;
     dirCache.current = {};
     searchCache.current = {};
     setEntries([]);
     setSearchEntries([]);
     setActive(0);
     setDismissed(false);
-  }, [cwd]);
+  }, [fileRefScopeKey]);
 
   useEffect(() => {
     setActive(0);
@@ -82,21 +91,23 @@ export function useFileReferenceMenu(text: string, cwd?: string) {
     const cached = dirCache.current[atDir];
     if (cached) {
       setEntries(cached);
-      return;
+    } else {
+      setEntries([]);
     }
     let live = true;
     app
-      .ListDir(atDir)
+      .ListDirForTab(fileRefTabId, atDir)
       .then((next) => {
         const list = asArray(next);
+        if (!live) return;
         dirCache.current[atDir] = list;
-        if (live) setEntries(list);
+        setEntries(list);
       })
       .catch(() => {});
     return () => {
       live = false;
     };
-  }, [atRaw === null, atDir, cwd]);
+  }, [atRaw === null, atDir, fileRefScopeKey, fileRefTabId]);
 
   useEffect(() => {
     if (atRaw === null || atDir !== "" || atFrag === "") {
@@ -105,23 +116,25 @@ export function useFileReferenceMenu(text: string, cwd?: string) {
     }
     const cached = searchCache.current[atFrag];
     if (cached) {
-      setSearchEntries(cached);
-      return;
+      setSearchEntries(cached.entries);
+      if (Date.now() - cached.cachedAt < FILE_REF_SEARCH_CACHE_TTL_MS) return;
+    } else {
+      setSearchEntries([]);
     }
-    setSearchEntries([]);
     let live = true;
     app
-      .SearchFileRefs(atFrag)
+      .SearchFileRefsForTab(fileRefTabId, atFrag)
       .then((next) => {
-        const list = next ?? [];
-        searchCache.current[atFrag] = list;
-        if (live) setSearchEntries(list);
+        const list = asArray(next);
+        if (!live) return;
+        searchCache.current[atFrag] = { entries: list, cachedAt: Date.now() };
+        setSearchEntries(list);
       })
       .catch(() => {});
     return () => {
       live = false;
     };
-  }, [atRaw === null, atDir, atFrag, cwd]);
+  }, [atRaw === null, atDir, atFrag, fileRefScopeKey, fileRefTabId]);
 
   const items = useMemo(() => {
     if (atRaw === null) return [];

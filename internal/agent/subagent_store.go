@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
+	"reasonix/internal/store"
 	"reasonix/internal/tool"
 )
 
@@ -150,7 +152,7 @@ func ListSubagentsByParent(sessionDir, parentSession string) ([]SubagentArtifact
 			continue
 		}
 		metaPath := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(metaPath)
+		data, err := fileencoding.ReadFileUTF8(metaPath)
 		if err != nil {
 			return nil, err
 		}
@@ -179,7 +181,15 @@ func DeleteSubagentsByParent(sessionDir, parentSession string) error {
 		return err
 	}
 	for _, artifact := range artifacts {
-		for _, path := range []string{artifact.SessionPath, artifact.MetaPath} {
+		paths := []string{artifact.SessionPath, artifact.MetaPath}
+		// Sub-agent saves are single-file today, but sweep transcript sidecars
+		// (event log, event index, …) so no earlier build's artifacts survive
+		// the delete.
+		paths = append(paths, store.SessionSidecarFiles(artifact.SessionPath)...)
+		for _, path := range paths {
+			if path == "" {
+				continue
+			}
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return err
 			}
@@ -557,7 +567,7 @@ func (s *SubagentStore) LoadMeta(ref string) (SubagentMeta, error) {
 	if !validSubagentRef(ref) {
 		return meta, fmt.Errorf("invalid subagent reference %q", ref)
 	}
-	data, err := os.ReadFile(s.metaPath(ref))
+	data, err := fileencoding.ReadFileUTF8(s.metaPath(ref))
 	if err != nil {
 		return meta, fmt.Errorf("load subagent metadata %q: %w", ref, err)
 	}

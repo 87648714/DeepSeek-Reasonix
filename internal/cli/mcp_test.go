@@ -100,6 +100,93 @@ func TestTokenizeArgs(t *testing.T) {
 	}
 }
 
+func TestMCPGetOpenDesignStyleInstall(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	addOut := captureStdout(t, func() {
+		if rc := Run([]string{
+			"mcp", "add", "open-design",
+			"--env", "OD_DAEMON_URL=http://127.0.0.1:7456",
+			"--env", "OPEN_DESIGN_TOKEN=placeholder-value",
+			"node", "open-design-mcp.js", "--stdio",
+		}, "test-version"); rc != 0 {
+			t.Fatalf("mcp add rc = %d, want 0", rc)
+		}
+	})
+	if !strings.Contains(addOut, `added MCP server "open-design"`) {
+		t.Fatalf("mcp add output = %q", addOut)
+	}
+
+	getOut := captureStdout(t, func() {
+		if rc := Run([]string{"mcp", "get", "open-design"}, "test-version"); rc != 0 {
+			t.Fatalf("mcp get rc = %d, want 0", rc)
+		}
+	})
+	for _, want := range []string{
+		"name: open-design",
+		"type: stdio",
+		"command: node",
+		"args: open-design-mcp.js",
+		"      --stdio",
+		"OD_DAEMON_URL=http://127.0.0.1:7456",
+		"OPEN_DESIGN_TOKEN=<redacted>",
+	} {
+		if !strings.Contains(getOut, want) {
+			t.Fatalf("mcp get output missing %q:\n%s", want, getOut)
+		}
+	}
+	if strings.Contains(getOut, "placeholder-value") {
+		t.Fatalf("mcp get leaked sensitive env value:\n%s", getOut)
+	}
+}
+
+func TestMCPGetMissingServerFails(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	errOut := captureStderr(t, func() {
+		if rc := Run([]string{"mcp", "get", "open-design"}, "test-version"); rc != 1 {
+			t.Fatalf("mcp get missing rc = %d, want 1", rc)
+		}
+	})
+	if !strings.Contains(errOut, `no MCP server named "open-design"`) {
+		t.Fatalf("mcp get missing stderr = %q", errOut)
+	}
+}
+
+func TestMCPGetRedactsRemoteAuthMaterial(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	_ = captureStdout(t, func() {
+		if rc := Run([]string{
+			"mcp", "add", "stripe",
+			"--http", "https://mcp.example.test/mcp?access_token=abc&key=xyz&workspace=main",
+			"--header", "Authorization=Bearer abc",
+		}, "test-version"); rc != 0 {
+			t.Fatalf("mcp add remote rc = %d, want 0", rc)
+		}
+	})
+
+	getOut := captureStdout(t, func() {
+		if rc := Run([]string{"mcp", "get", "stripe"}, "test-version"); rc != 0 {
+			t.Fatalf("mcp get remote rc = %d, want 0", rc)
+		}
+	})
+	for _, want := range []string{
+		"type: http",
+		"workspace=main",
+		"access_token=%3Credacted%3E",
+		"key=%3Credacted%3E",
+		"Authorization=<redacted>",
+	} {
+		if !strings.Contains(getOut, want) {
+			t.Fatalf("mcp get remote output missing %q:\n%s", want, getOut)
+		}
+	}
+	if strings.Contains(getOut, "Bearer abc") || strings.Contains(getOut, "access_token=abc") || strings.Contains(getOut, "key=xyz") {
+		t.Fatalf("mcp get leaked remote auth material:\n%s", getOut)
+	}
+}
+
 func TestRenderMCPStatusGroupsAndCompactsResources(t *testing.T) {
 	longURI := "file:///Users/example/project/docs/really/deep/path/with/a/very/long/resource-name.md"
 	got := renderMCPStatus(110,
@@ -140,6 +227,12 @@ func TestRenderMCPStatusCapsLongSections(t *testing.T) {
 	)
 	if !strings.Contains(got, "+2 more resources") {
 		t.Fatalf("rendered MCP status should cap long resource sections:\n%s", got)
+	}
+}
+
+func TestMCPCapabilitiesTextUsesAdvertisedTools(t *testing.T) {
+	if got := mcpCapabilitiesText(mcpServerView{HasTools: true}); got != "tools" {
+		t.Fatalf("mcpCapabilitiesText = %q, want tools", got)
 	}
 }
 
@@ -442,31 +535,19 @@ func TestMCPEditConfigLaunchEditorRejectsUnterminatedQuote(t *testing.T) {
 }
 
 // TestMCPEditConfigLaunchEditorRejectsShellMetachars confirms that shell
-// metacharacters in EDITOR/VISUAL are treated as literal argv tokens and
-// never executed as a shell command — the previous sh -lc construction would
-// have run "rm" here.
+// metacharacters in EDITOR/VISUAL are rejected before launch — the previous
+// sh -lc construction would have run "rm" here.
 func TestMCPEditConfigLaunchEditorRejectsShellMetachars(t *testing.T) {
 	t.Setenv("VISUAL", "")
 	t.Setenv("EDITOR", "vim; rm -rf /tmp/should-not-exist")
 
 	path := "/tmp/reasonix.toml"
-	launch, err := mcpEditConfigLaunchCommand(path, func(string) (string, error) {
+	_, err := mcpEditConfigLaunchCommand(path, func(string) (string, error) {
 		t.Fatal("lookPath should not be called when EDITOR is set")
 		return "", errors.New("unexpected lookup")
 	})
-	if err != nil {
-		t.Fatalf("edit command: %v", err)
-	}
-	// The entire EDITOR value is split on whitespace, so "vim;", "rm", "-rf",
-	// and the path become separate argv tokens — none of them are interpreted
-	// by a shell. The first token "vim;" is the (literal) program name; the
-	// shell injection payload "rm" is just an argument to it.
-	wantFirst := "vim;"
-	if launch.cmd.Args[0] != wantFirst {
-		t.Fatalf("first arg = %q, want %q (shell metachars must not be executed)", launch.cmd.Args[0], wantFirst)
-	}
-	if launch.cmd.Args[len(launch.cmd.Args)-1] != path {
-		t.Fatalf("last arg should be path, args=%v", launch.cmd.Args)
+	if err == nil || !strings.Contains(err.Error(), "shell control syntax") {
+		t.Fatalf("expected shell control rejection, got %v", err)
 	}
 }
 
@@ -536,25 +617,18 @@ func TestMCPEditConfigLaunchEditorExpandsTilde(t *testing.T) {
 }
 
 // TestMCPEditConfigLaunchEditorTildeNotInPayload confirms that a tilde
-// appearing in an injection payload (not as the leading token) is left
-// untouched and is NOT expanded into a path the shell would then execute.
+// appearing in an injection payload cannot be used because shell control syntax
+// is rejected before any expansion beyond the leading editor token matters.
 func TestMCPEditConfigLaunchEditorTildeNotInPayload(t *testing.T) {
 	t.Setenv("VISUAL", "")
 	t.Setenv("EDITOR", "vim; rm -rf ~/should-not-exist")
 
-	launch, err := mcpEditConfigLaunchCommand("/tmp/reasonix.toml", func(string) (string, error) {
+	_, err := mcpEditConfigLaunchCommand("/tmp/reasonix.toml", func(string) (string, error) {
 		t.Fatal("lookPath should not be called when EDITOR is set")
 		return "", errors.New("unexpected lookup")
 	})
-	if err != nil {
-		t.Fatalf("edit command: %v", err)
-	}
-	// The tilde sits in the middle of the value, so it is NOT expanded; the
-	// leading token "vim;" is looked up literally and the payload "rm" never
-	// runs. This proves tilde expansion cannot be abused to make an injection
-	// payload resolve to a real path.
-	if launch.cmd.Args[0] != "vim;" {
-		t.Fatalf("args[0] = %q, want vim;", launch.cmd.Args[0])
+	if err == nil || !strings.Contains(err.Error(), "shell control syntax") {
+		t.Fatalf("expected shell control rejection, got %v", err)
 	}
 }
 

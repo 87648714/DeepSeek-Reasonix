@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
+	"reasonix/internal/control"
 	"reasonix/internal/event"
 	"reasonix/internal/permission"
 	"reasonix/internal/provider"
@@ -46,15 +48,21 @@ const maxResultChars = 8000
 type updateSink struct {
 	conn      notifier
 	sessionID string
-	approve   func(id string, allow, session, persist bool)
-	answer    func(id string, answers []event.AskAnswer)
-	mu        sync.Mutex
-	turnCtx   context.Context
+	// cwd resolves relative tool-arg paths for tool_call locations. Set once
+	// via bindCwd before the sink receives events.
+	cwd     string
+	approve func(id string, allow, session, persist bool)
+	answer  func(id string, answers []event.AskAnswer)
+	mu      sync.Mutex
+	turnCtx context.Context
 }
 
 func newUpdateSink(conn notifier, sessionID string) *updateSink {
 	return &updateSink{conn: conn, sessionID: sessionID}
 }
+
+// bindCwd installs the session root used to absolutize tool_call locations.
+func (s *updateSink) bindCwd(cwd string) { s.cwd = cwd }
 
 // bindApprove installs the controller's Approve callback, called by the service
 // once the controller exists (the sink is built first, to hand to the Factory).
@@ -116,6 +124,13 @@ func (s *updateSink) Emit(e event.Event) {
 		if e.Tool.Partial {
 			return
 		}
+		// todo_write is the agent's task list; mirror it as an ACP plan update so
+		// the client renders structured progress alongside the tool_call.
+		if e.Tool.Name == "todo_write" {
+			if entries, ok := planEntriesFromTodoArgs(e.Tool.Args); ok {
+				s.send(planUpdate{SessionUpdate: "plan", Entries: entries})
+			}
+		}
 		s.send(toolCall{
 			SessionUpdate: "tool_call",
 			ToolCallID:    e.Tool.ID,
@@ -123,6 +138,7 @@ func (s *updateSink) Emit(e event.Event) {
 			Kind:          toolKindFor(e.Tool.Name),
 			Status:        "pending",
 			RawInput:      rawJSON(e.Tool.Args),
+			Locations:     s.toolLocations(e.Tool.Name, e.Tool.Args),
 		})
 
 	case event.ToolResult:
@@ -205,7 +221,15 @@ func (s *updateSink) replay(msgs []provider.Message) {
 					Kind:          toolKindFor(tc.Name),
 					Status:        "completed",
 					RawInput:      rawJSON(tc.Arguments),
+					Locations:     s.toolLocations(tc.Name, tc.Arguments),
 				})
+				// Replaying the latest plan keeps the client's plan view in sync
+				// with the restored conversation; each update replaces the last.
+				if tc.Name == "todo_write" {
+					if entries, ok := planEntriesFromTodoArgs(tc.Arguments); ok {
+						s.send(planUpdate{SessionUpdate: "plan", Entries: entries})
+					}
+				}
 			}
 		case provider.RoleTool:
 			s.send(toolCallUpdateMsg{
@@ -251,8 +275,6 @@ func (s *updateSink) requestPermission(ctx context.Context, a event.Approval) {
 				allow = true
 			case OptAllowAlways:
 				allow, session = true, true
-			case OptAllowPersistent:
-				allow, session, persist = true, true, true
 			}
 		}
 	}
@@ -331,18 +353,32 @@ func (s *updateSink) requestAskQuestion(ctx context.Context, askID string, q eve
 	return label, ok
 }
 
-func approvalOptionNames(tool, subject string) (session, persistent string) {
+func approvalSessionOptionName(tool, subject string) string {
+	if tool == control.SandboxEscapeApprovalTool {
+		return "Use real environment for this session"
+	}
 	sessionRule := permission.SessionGrantRuleForScope(tool, subject)
-	persistentRule := permission.RememberRuleForScope(tool, subject)
-	return "Allow " + sessionRule + " for this session", "Always allow " + persistentRule + " (save to config)"
+	return "Allow " + sessionRule + " for this session"
 }
 
 func approvalOptions(tool, subject string) []PermissionOption {
-	allowSessionName, allowPersistentName := approvalOptionNames(tool, subject)
+	if control.RequiresFreshHumanApprovalTool(tool) {
+		if tool == control.SandboxEscapeApprovalTool {
+			return []PermissionOption{
+				{OptionID: string(OptAllowOnce), Name: "Allow", Kind: OptAllowOnce},
+				{OptionID: string(OptAllowAlways), Name: approvalSessionOptionName(tool, subject), Kind: OptAllowAlways},
+				{OptionID: string(OptRejectOnce), Name: "Reject", Kind: OptRejectOnce},
+			}
+		}
+		return []PermissionOption{
+			{OptionID: string(OptAllowOnce), Name: "Allow", Kind: OptAllowOnce},
+			{OptionID: string(OptRejectOnce), Name: "Reject", Kind: OptRejectOnce},
+		}
+	}
+	allowSessionName := approvalSessionOptionName(tool, subject)
 	options := []PermissionOption{
 		{OptionID: string(OptAllowOnce), Name: "Allow", Kind: OptAllowOnce},
 		{OptionID: string(OptAllowAlways), Name: allowSessionName, Kind: OptAllowAlways},
-		{OptionID: string(OptAllowPersistent), Name: allowPersistentName, Kind: OptAllowPersistent},
 		{OptionID: string(OptRejectOnce), Name: "Reject", Kind: OptRejectOnce},
 	}
 	return options
@@ -387,6 +423,8 @@ func toolKindFor(name string) string {
 		return "edit"
 	case "bash":
 		return "execute"
+	case control.SandboxEscapeApprovalTool:
+		return "execute"
 	}
 	n := strings.ToLower(name)
 	switch {
@@ -401,4 +439,86 @@ func toolKindFor(name string) string {
 	default:
 		return "other"
 	}
+}
+
+// locationTools names the builtin tools whose "path" argument is a real file
+// target worth a follow-along location. Search/list tools are excluded: their
+// path is a directory scope, not a file the user would want opened.
+var locationTools = map[string]bool{
+	"read_file":     true,
+	"write_file":    true,
+	"edit_file":     true,
+	"multi_edit":    true,
+	"notebook_edit": true,
+	"delete_range":  true,
+	"delete_symbol": true,
+	"code_index":    true,
+}
+
+// toolLocations derives the file location a tool call touches from its raw
+// args, so the client can follow along in the editor. Unknown tools and
+// path-less args yield nil.
+func (s *updateSink) toolLocations(name, rawArgs string) []ToolCallLocation {
+	if !locationTools[name] {
+		return nil
+	}
+	var p struct {
+		Path   string `json:"path"`
+		Offset int    `json:"offset"`
+	}
+	if json.Unmarshal([]byte(rawArgs), &p) != nil || strings.TrimSpace(p.Path) == "" {
+		return nil
+	}
+	loc := ToolCallLocation{Path: s.absPath(p.Path)}
+	// read_file's offset is a 0-based start line; surface it so the editor can
+	// jump to the region being read.
+	if name == "read_file" && p.Offset > 0 {
+		line := p.Offset + 1
+		loc.Line = &line
+	}
+	return []ToolCallLocation{loc}
+}
+
+func (s *updateSink) absPath(p string) string {
+	if filepath.IsAbs(p) || s.cwd == "" {
+		return p
+	}
+	return filepath.Join(s.cwd, p)
+}
+
+// planEntriesFromTodoArgs maps a todo_write argument payload onto ACP plan
+// entries. Phase items (level 0) rank high, sub-steps medium; unknown statuses
+// degrade to pending so a malformed item cannot poison the whole update.
+func planEntriesFromTodoArgs(rawArgs string) ([]PlanEntry, bool) {
+	var p struct {
+		Todos []struct {
+			Content string `json:"content"`
+			Status  string `json:"status"`
+			Level   int    `json:"level"`
+		} `json:"todos"`
+	}
+	if json.Unmarshal([]byte(rawArgs), &p) != nil || len(p.Todos) == 0 {
+		return nil, false
+	}
+	entries := make([]PlanEntry, 0, len(p.Todos))
+	for _, t := range p.Todos {
+		if strings.TrimSpace(t.Content) == "" {
+			continue
+		}
+		status := t.Status
+		switch status {
+		case "pending", "in_progress", "completed":
+		default:
+			status = "pending"
+		}
+		priority := "medium"
+		if t.Level == 0 {
+			priority = "high"
+		}
+		entries = append(entries, PlanEntry{Content: t.Content, Priority: priority, Status: status})
+	}
+	if len(entries) == 0 {
+		return nil, false
+	}
+	return entries, true
 }

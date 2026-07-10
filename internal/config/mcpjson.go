@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/mcpdiag"
 )
 
@@ -40,7 +41,7 @@ type mcpServerSpec struct {
 // file is not an error (returns nil, nil). A present-but-malformed file is an
 // error so a typo surfaces loudly instead of silently dropping every server.
 func loadMCPJSON(path string) ([]PluginEntry, error) {
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
@@ -90,6 +91,9 @@ func specsToEntries(specs map[string]mcpServerSpec, skip map[string]bool) []Plug
 
 // legacyConfigPath is the v0.x (TypeScript line) config file, ~/.reasonix/config.json.
 func legacyConfigPath() string {
+	if IsolatedHomeDir() != "" {
+		return ""
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -109,7 +113,7 @@ func loadLegacyMCP(path string) []PluginEntry {
 	if path == "" {
 		return nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return nil
 	}
@@ -299,7 +303,7 @@ func trustMCPJSONReadOnlyTool(path, name, toolName string) (PluginEntry, bool, e
 func readMCPJSONRaw(path string) (map[string]json.RawMessage, map[string]json.RawMessage, error) {
 	root := map[string]json.RawMessage{}
 	servers := map[string]json.RawMessage{}
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if os.IsNotExist(err) {
 		return root, servers, nil
 	}
@@ -355,7 +359,7 @@ func writeMCPJSONServers(path string, root map[string]json.RawMessage, servers m
 }
 
 func clearMCPJSONAuthentication(path, name string) (PluginEntry, bool, error) {
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if os.IsNotExist(err) {
 		return PluginEntry{}, false, fmt.Errorf("clear plugin authentication: no plugin %q", name)
 	}
